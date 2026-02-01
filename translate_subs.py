@@ -46,6 +46,7 @@ ES_STOPWORDS = {
     "pero", "porque", "como", "cuando", "donde", "quien", "quienes", "ser",
     "soy", "eres", "somos", "son", "estoy", "estas", "esta", "estan",
 }
+BULK_DIR_NAME = "SUBS_BULK"
 
 
 class SimpleConsole:
@@ -753,11 +754,32 @@ def detect_language(text: str) -> Tuple[str, float]:
     return lang, confidence
 
 
+def bulk_dir() -> Path:
+    return Path.cwd() / BULK_DIR_NAME
+
+
+def resolve_input_path(path_like: str | Path) -> Path:
+    path = Path(path_like)
+    if path.is_absolute() or path.parent != Path("."):
+        return path
+    return bulk_dir() / path
+
+
+def resolve_output_path(path_like: str | Path) -> Path:
+    path = Path(path_like)
+    if path.is_absolute() or path.parent != Path("."):
+        return path
+    return bulk_dir() / path
+
+
 def list_subtitle_files(exts: List[str]) -> List[Path]:
+    base_dir = bulk_dir()
+    if not base_dir.exists():
+        return []
     files = []
     for ext in exts:
-        files.extend(Path.cwd().glob(f"*{ext}"))
-        files.extend(Path.cwd().glob(f"*{ext.upper()}"))
+        files.extend(base_dir.glob(f"*{ext}"))
+        files.extend(base_dir.glob(f"*{ext.upper()}"))
     return sorted(set(files))
 
 
@@ -845,11 +867,12 @@ def build_output_path(in_path: Path, target_lang: str) -> Path:
     lang = target_lang.strip().lower()
     suffix = in_path.suffix
     stem = in_path.stem
+    out_dir = bulk_dir()
     if lang in ("spanish", "es", "es-419", "es_419"):
-        return in_path.with_name(f"{stem}_es-419{suffix}")
+        return out_dir / f"{stem}_es-419{suffix}"
     if lang in ("english", "en", "en-us", "en_us", "en-gb", "en_gb"):
-        return in_path.with_name(f"{stem}_en{suffix}")
-    return in_path.with_name(f"{stem}.translated{suffix}")
+        return out_dir / f"{stem}_en{suffix}"
+    return out_dir / f"{stem}.translated{suffix}"
 
 
 def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, str]:
@@ -867,13 +890,13 @@ def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, 
             if 1 <= idx <= len(files):
                 in_path = files[idx - 1]
         elif raw:
-            in_path = Path(raw)
+            in_path = resolve_input_path(raw)
         else:
             if len(files) == 1:
                 in_path = files[0]
     if in_path is None:
         raw = input("Enter subtitle file path: ").strip()
-        in_path = Path(raw)
+        in_path = resolve_input_path(raw)
     if not in_path.exists():
         raise RuntimeError(f"Input not found: {in_path}")
 
@@ -915,7 +938,7 @@ def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, 
 
     model = choose_model(console, args.model)
 
-    out_path = Path(args.out_path) if args.out_path else build_output_path(in_path, target_lang)
+    out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, target_lang)
     cprint(console, f"Output file: {out_path}", "bold cyan")
     if skip_summary:
         cprint(console, "Sample mode: skipping summary for speed.", "yellow")
@@ -985,11 +1008,11 @@ def main() -> int:
         if model:
             args.model = model
     else:
-        in_path = Path(args.in_path)
+        in_path = resolve_input_path(args.in_path)
         if not in_path.exists():
             print(f"Input not found: {in_path}", file=sys.stderr)
             return 2
-        out_path = Path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
+        out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
 
     apply_fast_profile(args, console)
 
@@ -1056,6 +1079,7 @@ def main() -> int:
         print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
         return 2
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     write_text(out_path, out_text.splitlines(), line_ending, final_newline, bom)
     elapsed = time.time() - start
     cprint(console, f"Translated blocks: {translated_count}", "bold green")

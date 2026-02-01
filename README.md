@@ -46,6 +46,11 @@ Modo directo:
 python translate_subs.py --in "archivo.ass" --target Spanish --model gemma3:4b --fast
 ```
 
+Nota:
+
+- Si pasas solo nombre de archivo (sin ruta), `translate_subs.py` busca el input en `SUBS_BULK/`.
+- La salida por defecto tambien se guarda en `SUBS_BULK/`.
+
 Opciones utiles:
 
 - `--out`: ruta de salida.
