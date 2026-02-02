@@ -34,6 +34,14 @@ except ImportError:
 
 ASS_TAG_RE = re.compile(r"(\{[^}]*\}|\\N|\\n|\\h)")
 ASS_STRIP_RE = re.compile(r"\{[^}]*\}")
+ASS_PLACEHOLDER_TOKEN_RE = re.compile(r"__ASS_TAG_\d+__")
+SUMMARY_MARKERS = (
+    "summary",
+    "resumen",
+    "en esta escena",
+    "en este episodio",
+    "a lo largo de",
+)
 EN_STOPWORDS = {
     "the", "and", "you", "your", "for", "with", "that", "this", "was", "are",
     "but", "not", "from", "they", "she", "him", "her", "have", "has", "had",
@@ -47,6 +55,7 @@ ES_STOPWORDS = {
     "soy", "eres", "somos", "son", "estoy", "estas", "esta", "estan",
 }
 BULK_DIR_NAME = "SUBS_BULK"
+SINGLE_TRANSLATION_CACHE = {}
 
 
 class SimpleConsole:
@@ -317,6 +326,175 @@ def extract_json_object(text: str) -> dict | None:
     return None
 
 
+def count_words(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9']+", text))
+
+
+def ascii_word_tokens(text: str) -> List[str]:
+    return [t.lower() for t in re.findall(r"[A-Za-z']+", text)]
+
+
+def is_suspicious_translation(source: str, translated: str) -> bool:
+    src = source.strip()
+    dst = translated.strip()
+    if not dst:
+        return True
+
+    src_words = count_words(src)
+    dst_words = count_words(dst)
+    src_len = len(src)
+    dst_len = len(dst)
+    src_lower = src.lower()
+    dst_lower = dst.lower()
+
+    if src_lower == dst_lower:
+        src_ascii = ascii_word_tokens(src)
+        if any(token in EN_STOPWORDS for token in src_ascii):
+            return True
+
+    if src_words <= 2:
+        return dst_words >= 18 and dst_len > 90
+    if src_words <= 12 and dst_words > max(30, src_words * 4):
+        return True
+    if src_len <= 80 and dst_len > 220:
+        return True
+    if dst_len > max(320, int(src_len * 4) + 120):
+        return True
+
+    if src_len >= 20 and src_lower in dst_lower and dst_len > src_len + 12:
+        return True
+
+    src_ascii = ascii_word_tokens(src)
+    dst_ascii = set(ascii_word_tokens(dst))
+    if src_ascii and dst_ascii:
+        contraction_tokens = [t for t in src_ascii if "'" in t]
+        if any(t in dst_ascii for t in contraction_tokens):
+            return True
+        shared_long = [
+            t
+            for t in src_ascii
+            if len(t) >= 4 and t in dst_ascii and t not in {"tsuda", "ito", "nadeshiko", "toonshub"}
+        ]
+        if len(set(shared_long)) >= 2:
+            return True
+
+    if dst_words > 35 and any(marker in dst_lower for marker in SUMMARY_MARKERS):
+        return True
+    return False
+
+
+def ass_placeholders_match(source_protected: str, translated: str) -> bool:
+    expected = ASS_PLACEHOLDER_TOKEN_RE.findall(source_protected)
+    actual = ASS_PLACEHOLDER_TOKEN_RE.findall(translated)
+    return expected == actual
+
+
+def has_ass_markup(text: str) -> bool:
+    return ASS_TAG_RE.search(text) is not None
+
+
+def ass_structure_preserved(source: str, translated: str) -> bool:
+    return ASS_TAG_RE.findall(source) == ASS_TAG_RE.findall(translated)
+
+
+def has_placeholder_artifacts(text: str) -> bool:
+    return "ASS_TAG" in text
+
+
+def guarded_translate_one(
+    client: OllamaClient,
+    text: str,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+    source_for_checks: str | None = None,
+    validator=None,
+    prefer_no_context: bool = False,
+) -> str | None:
+    source_check = source_for_checks if source_for_checks is not None else text
+    if prefer_no_context:
+        attempts = [("", "")]
+    else:
+        attempts = [(summary, tone_guide), ("", "")]
+        if not summary and not tone_guide:
+            attempts = [("", "")]
+    for sum_ctx, tone_ctx in attempts:
+        cache_key = (
+            text,
+            sum_ctx,
+            tone_ctx,
+            target_lang,
+            tuple(sorted((options or {}).items())),
+        )
+        candidate = SINGLE_TRANSLATION_CACHE.get(cache_key)
+        if candidate is None:
+            candidate = translate_one(client, text, sum_ctx, tone_ctx, target_lang, options)
+            SINGLE_TRANSLATION_CACHE[cache_key] = candidate
+        if not candidate:
+            continue
+        if has_placeholder_artifacts(candidate) and "__ASS_TAG_" not in text:
+            continue
+        if not ass_placeholders_match(text, candidate):
+            continue
+        if validator and not validator(candidate):
+            continue
+        if is_suspicious_translation(source_check, candidate):
+            continue
+        return candidate
+    return None
+
+
+def translate_ass_text_field_segmented(
+    client: OllamaClient,
+    text_field: str,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+) -> str:
+    tokens = split_ass_text(text_field)
+    segments: List[Tuple[int, str]] = []
+    for idx, token in enumerate(tokens):
+        if token.startswith("{") or token in ("\\N", "\\n", "\\h"):
+            continue
+        if not should_translate(token):
+            continue
+        segments.append((idx, token))
+
+    if not segments:
+        return "".join(tokens)
+
+    sources = [segment for _, segment in segments]
+    batch_out = translate_batch(client, sources, summary, tone_guide, target_lang, options)
+    if batch_out is None or len(batch_out) != len(sources):
+        batch_out = [None] * len(sources)
+
+    for (idx, source), candidate in zip(segments, batch_out):
+        fixed = None
+        if candidate:
+            if (
+                not has_ass_markup(candidate)
+                and not has_placeholder_artifacts(candidate)
+                and not is_suspicious_translation(source, candidate)
+            ):
+                fixed = candidate
+
+        safe = guarded_translate_one(
+            client,
+            source,
+            summary,
+            tone_guide,
+            target_lang,
+            options,
+            source_for_checks=source,
+            validator=lambda cand: not has_ass_markup(cand) and not has_placeholder_artifacts(cand),
+            prefer_no_context=True,
+        ) if fixed is None else fixed
+        tokens[idx] = safe if safe is not None else source
+    return "".join(tokens)
+
+
 def translate_batch(
     client: OllamaClient,
     texts: List[str],
@@ -331,6 +509,12 @@ def translate_batch(
     tone_short = tone_guide.strip()
     if len(tone_short) > 800:
         tone_short = tone_short[:800] + "..."
+    has_placeholders = any("__ASS_TAG_" in item for item in texts)
+    placeholder_rule = (
+        "If placeholders like __ASS_TAG_0__ appear, keep them exactly. "
+        if has_placeholders
+        else "Do not introduce placeholders like __ASS_TAG_0__ if they are not in the source. "
+    )
     system_msg = (
         "You are a professional subtitle translator. "
         "Translate from English to the target language. "
@@ -342,7 +526,9 @@ def translate_batch(
         f"Tone guide (apply per line): {tone_short}\n"
         f"Translate each item in the JSON array from English to {target_lang}. "
         "Keep line breaks. Keep ASS tags in braces and control codes \\N, \\n, \\h unchanged. "
-        "If placeholders like __ASS_TAG_0__ appear, keep them exactly. "
+        "Translate only the current line, never summarize a scene or multiple lines. "
+        "Fully translate every word from the source; do not drop connectors or leave source fragments. "
+        f"{placeholder_rule}"
         "Respect sarcasm, double meanings, and register (formal/informal) as guided; do not neutralize tone. "
         "Return ONLY a JSON array of strings, same length and order.\n\n"
         f"Input JSON: {json.dumps(texts, ensure_ascii=False)}"
@@ -371,6 +557,12 @@ def translate_one(
     tone_short = tone_guide.strip()
     if len(tone_short) > 800:
         tone_short = tone_short[:800] + "..."
+    has_placeholders = "__ASS_TAG_" in text
+    placeholder_rule = (
+        "If placeholders like __ASS_TAG_0__ appear, keep them exactly.\n\n"
+        if has_placeholders
+        else "Do not introduce placeholders like __ASS_TAG_0__ if they are not in the source.\n\n"
+    )
     system_msg = (
         "You are a professional subtitle translator. "
         "Translate from English to the target language. "
@@ -382,7 +574,9 @@ def translate_one(
         f"Tone guide (apply per line): {tone_short}\n"
         f"Translate to {target_lang}. Return ONLY the translated text. "
         "Keep ASS tags in braces and control codes \\N, \\n, \\h unchanged. "
-        "If placeholders like __ASS_TAG_0__ appear, keep them exactly.\n\n"
+        "Translate only this line, never summarize the plot or add narration. "
+        "Fully translate every word from the source; do not drop connectors or leave source fragments. "
+        f"{placeholder_rule}"
         "Respect sarcasm, double meanings, and register (formal/informal) as guided; do not neutralize tone.\n\n"
         f"Text: {text}"
     )
@@ -483,10 +677,28 @@ def translate_srt(
                         out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
                 translations.extend(out)
                 progress.advance(task_id, len(batch))
+        cprint(console, "Applying quality checks...", "cyan")
 
-    for (block_idx, _), translated in zip(trans_map, translations):
+    for (block_idx, source_text), translated in zip(trans_map, translations):
+        fixed = translated
+        needs_retry = (
+            is_suspicious_translation(source_text, translated)
+            or not ass_placeholders_match(source_text, translated)
+        )
+        if needs_retry:
+            retry = guarded_translate_one(
+                client,
+                source_text,
+                summary,
+                tone_guide,
+                target_lang,
+                options,
+                source_for_checks=source_text,
+                prefer_no_context=True,
+            )
+            fixed = retry if retry is not None else source_text
         block = blocks[block_idx]
-        new_lines = translated.split("\n") if translated else [""]
+        new_lines = fixed.split("\n") if fixed else [""]
         blocks[block_idx] = [block[0], block[1], *new_lines]
 
     out_lines = []
@@ -570,6 +782,8 @@ def translate_ass(
             "kind": kind,
             "spaces": spaces,
             "fields": fields,
+            "text_field": text_field,
+            "protected": protected,
             "replacements": replacements,
             "text_idx": text_idx,
         }
@@ -589,12 +803,90 @@ def translate_ass(
                         out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
                 translations.extend(out)
                 progress.advance(task_id, len(batch))
+        cprint(console, "Applying ASS safety checks...", "cyan")
 
     for line_idx, translated in zip(trans_map, translations):
         state = line_state.get(line_idx)
         if not state:
             continue
-        restored = ass_restore_tags(translated, state["replacements"])
+        placeholder_ok = ass_placeholders_match(state["protected"], translated)
+        protected_retry = None
+        did_retry_protected = False
+        if not placeholder_ok or has_ass_markup(translated):
+            protected_retry = guarded_translate_one(
+                client,
+                state["protected"],
+                summary,
+                tone_guide,
+                target_lang,
+                options,
+                source_for_checks=ass_plain_text(state["text_field"]),
+                validator=lambda cand, src=state["protected"]: ass_placeholders_match(src, cand)
+                and not has_ass_markup(cand),
+                prefer_no_context=True,
+            )
+            did_retry_protected = True
+            if protected_retry is not None:
+                translated = protected_retry
+                placeholder_ok = True
+
+        if placeholder_ok:
+            restored = ass_restore_tags(translated, state["replacements"])
+            source_plain = ass_plain_text(state["text_field"])
+            restored_plain = ass_plain_text(restored)
+            structure_ok = ass_structure_preserved(state["text_field"], restored)
+            if (
+                not structure_ok
+                or has_placeholder_artifacts(restored)
+                or is_suspicious_translation(source_plain, restored_plain)
+            ):
+                retry = None
+                if not did_retry_protected:
+                    retry = guarded_translate_one(
+                        client,
+                        state["protected"],
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        source_for_checks=source_plain,
+                        validator=lambda cand, src=state["protected"]: ass_placeholders_match(src, cand)
+                        and not has_ass_markup(cand),
+                        prefer_no_context=True,
+                    )
+                if retry is not None:
+                    restored = ass_restore_tags(retry, state["replacements"])
+                    if (
+                        not ass_structure_preserved(state["text_field"], restored)
+                        or has_placeholder_artifacts(restored)
+                        or is_suspicious_translation(source_plain, ass_plain_text(restored))
+                    ):
+                        restored = translate_ass_text_field_segmented(
+                            client,
+                            state["text_field"],
+                            summary,
+                            tone_guide,
+                            target_lang,
+                            options,
+                        )
+                else:
+                    restored = translate_ass_text_field_segmented(
+                        client,
+                        state["text_field"],
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                    )
+        else:
+            restored = translate_ass_text_field_segmented(
+                client,
+                state["text_field"],
+                summary,
+                tone_guide,
+                target_lang,
+                options,
+            )
         fields = state["fields"]
         fields[state["text_idx"]] = restored
         lines[line_idx] = f"{state['kind']}:{state['spaces']}{','.join(fields)}"
@@ -680,11 +972,30 @@ def translate_ass_segment(
                         out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
                 translations.extend(out)
                 progress.advance(task_id, len(batch))
+        cprint(console, "Applying ASS safety checks...", "cyan")
 
-    for (line_idx, token_idx, _), translated in zip(trans_tasks, translations):
+    for (line_idx, token_idx, source_token), translated in zip(trans_tasks, translations):
         state = line_state.get(line_idx)
         if state:
-            state["tokens"][token_idx] = translated
+            fixed = translated
+            needs_retry = (
+                is_suspicious_translation(source_token, translated)
+                or not ass_placeholders_match(source_token, translated)
+                or has_ass_markup(translated)
+            )
+            if needs_retry:
+                retry = guarded_translate_one(
+                    client,
+                    source_token,
+                    summary,
+                    tone_guide,
+                    target_lang,
+                    options,
+                    source_for_checks=source_token,
+                    validator=lambda cand: not has_ass_markup(cand) and not has_placeholder_artifacts(cand),
+                )
+                fixed = retry if retry is not None else source_token
+            state["tokens"][token_idx] = fixed
 
     for line_idx, state in line_state.items():
         new_text = "".join(state["tokens"])
