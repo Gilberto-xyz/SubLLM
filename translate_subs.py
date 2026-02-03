@@ -71,6 +71,8 @@ REPAIR_BATCH_MAX = 8
 MAX_REPAIR_FALLBACK_LINES = 3
 DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
+PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
+DEFAULT_OUT_FRACTION = 0.60    # si num_predict no viene definido, reservar ~60% ctx para output
 TRANSLATION_SUMMARY_MAX = 600
 TRANSLATION_TONE_MAX = 400
 ROLLING_CONTEXT_MAX_CHARS = 600
@@ -905,10 +907,12 @@ def estimate_tokens_from_text(text: str) -> int:
 def translation_budget(options) -> Tuple[int, int]:
     opts = options or {}
     num_ctx = int(opts.get("num_ctx") or DEFAULT_CTX_TOKENS)
-    num_predict = int(opts.get("num_predict") or DEFAULT_PREDICT_TOKENS)
-    budget = max(256, int(math.floor(num_ctx * 0.85)))
-    reserve_out = min(num_predict, int(math.floor(num_ctx * 0.35)))
-    reserve_out = max(64, reserve_out)
+    num_predict = int(opts.get("num_predict") or 0)
+    # Reserva de salida coherente con cómo luego calculas num_predict dinámico.
+    reserve_out = num_predict if num_predict > 0 else int(math.floor(num_ctx * DEFAULT_OUT_FRACTION))
+    reserve_out = max(256, min(4096, reserve_out))
+    # Presupuesto de entrada real: ctx - reserva_out - overhead fijo.
+    budget = max(256, num_ctx - reserve_out - PROMPT_OVERHEAD_TOKENS)
     return budget, reserve_out
 
 
@@ -966,12 +970,12 @@ def build_options_for_batch(options, texts: List[str], force_temperature_zero: b
     num_ctx = int(options_batch.get("num_ctx") or DEFAULT_CTX_TOKENS)
     in_tokens = sum(estimate_tokens_from_text(text) for text in texts)
     est_out = int(math.ceil(in_tokens * 1.2)) + 64
-    cap = min(4096, int(math.floor(num_ctx * 0.45)))
     base_predict = int(options_batch.get("num_predict") or 0)
     desired_predict = max(base_predict, est_out)
-    if cap > 0:
-        desired_predict = min(desired_predict, cap)
-    options_batch["num_predict"] = max(64, desired_predict)
+    # Cap por tokens realmente disponibles (evita truncar JSON a mitad).
+    available = max(64, num_ctx - in_tokens - PROMPT_OVERHEAD_TOKENS)
+    cap = min(4096, available)
+    options_batch["num_predict"] = max(64, min(desired_predict, cap))
     if force_temperature_zero:
         options_batch["temperature"] = 0.0
     return options_batch
@@ -1750,6 +1754,45 @@ def retry_single_item_translation(
     return strip_label_prefix(out[0])
 
 
+def retry_failed_items_batch(
+    client: OllamaClient,
+    failed_items: List[dict],
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+    mode: str,
+) -> None:
+    """Reintenta en batch (temp=0 + schema) para evitar N llamadas 1x1 cuando el batch salió muy mal."""
+    if not failed_items:
+        return
+    sources = [it["protected_text"] for it in failed_items]
+    out = translate_json_batch_with_split(
+        client,
+        sources,
+        summary,
+        tone_guide,
+        target_lang,
+        options,
+        mode=mode,
+        rolling_context="",
+        force_temperature_zero=True,
+    )
+    for it, cand in zip(failed_items, out):
+        if cand is None:
+            continue
+        if mode == "ass_protected":
+            it["text_field"] = it["original_text_field"]
+            it["protected"] = it["protected_text"]
+            status = scan_ass_line_candidate(it, cand, target_lang)
+            it["candidate"] = status["candidate"]
+            it["status"] = status
+        else:
+            status = scan_srt_candidate(it, cand, target_lang)
+            it["candidate"] = status["candidate"]
+            it["status"] = status
+
+
 def translate_srt(
     client: OllamaClient,
     text: str,
@@ -1797,8 +1840,14 @@ def translate_srt(
             failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
             repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
             if failed_items and len(failed_items) > repair_limit:
-                cprint(console, "Too many SRT lines flagged; skipping fallback for this batch.", "yellow")
-            elif failed_items:
+                cprint(
+                    console,
+                    f"High fail-rate: {len(failed_items)}/{len(batch)} SRT flagged. Retrying batch @temp=0...",
+                    "yellow",
+                )
+                retry_failed_items_batch(client, failed_items, summary, tone_guide, target_lang, options, mode="srt_block")
+                failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            if failed_items:
                 for item in failed_items:
                     repaired = fallback_srt_linewise(
                         client,
@@ -1923,17 +1972,23 @@ def translate_ass(
             failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
             repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
             if failed_items and len(failed_items) > repair_limit:
-                cprint(console, "Too many ASS lines flagged; skipping fallback for this batch.", "yellow")
-            elif failed_items:
-                run_ass_surgical_fallback(
+                cprint(
+                    console,
+                    f"High fail-rate: {len(failed_items)}/{len(batch)} ASS flagged. Retrying batch @temp=0...",
+                    "yellow",
+                )
+                retry_failed_items_batch(
                     client,
                     failed_items,
                     summary,
                     tone_guide,
                     target_lang,
                     options,
-                    console,
+                    mode="ass_protected",
                 )
+                failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            if failed_items:
+                run_ass_surgical_fallback(client, failed_items, summary, tone_guide, target_lang, options, console)
 
             for item in batch:
                 status = item["status"]
