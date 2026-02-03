@@ -8,6 +8,8 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -124,6 +126,78 @@ def progress_bar(console):
     return DummyProgress()
 
 
+class RuntimeMetrics:
+    def __init__(self) -> None:
+        self.seconds = defaultdict(float)
+        self.calls = defaultdict(int)
+        self.counters = defaultdict(int)
+
+    def reset(self) -> None:
+        self.seconds.clear()
+        self.calls.clear()
+        self.counters.clear()
+
+    @contextmanager
+    def timed(self, key: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.seconds[key] += time.perf_counter() - start
+            self.calls[key] += 1
+
+    def bump(self, key: str, amount: int = 1) -> None:
+        self.counters[key] += amount
+
+    def total_by_prefix(self, prefix: str) -> float:
+        return sum(value for name, value in self.seconds.items() if name.startswith(prefix))
+
+
+RUNTIME_METRICS = RuntimeMetrics()
+
+
+def print_runtime_breakdown(console, total_elapsed: float) -> None:
+    summary_elapsed = RUNTIME_METRICS.seconds.get("stage.summary", 0.0)
+    tone_elapsed = RUNTIME_METRICS.seconds.get("stage.tone_guide", 0.0)
+    translate_elapsed = RUNTIME_METRICS.seconds.get("stage.translate", 0.0)
+    retry_chat_elapsed = RUNTIME_METRICS.total_by_prefix("retry.chat.")
+    translate_core_elapsed = max(0.0, translate_elapsed - retry_chat_elapsed)
+    other_elapsed = max(0.0, total_elapsed - (summary_elapsed + tone_elapsed + translate_elapsed))
+
+    cprint(console, "Timing breakdown:", "bold cyan")
+    cprint(console, f"- summary: {summary_elapsed:.1f}s", "cyan")
+    cprint(console, f"- tone guide: {tone_elapsed:.1f}s", "cyan")
+    cprint(console, f"- translate core: {translate_core_elapsed:.1f}s", "cyan")
+    cprint(console, f"- retries (LLM): {retry_chat_elapsed:.1f}s", "cyan")
+    if other_elapsed >= 0.1:
+        cprint(console, f"- other: {other_elapsed:.1f}s", "cyan")
+
+    retry_attempts = (
+        RUNTIME_METRICS.counters.get("retry.batch_temp0.attempts", 0)
+        + RUNTIME_METRICS.counters.get("retry.srt_linewise.attempts", 0)
+        + RUNTIME_METRICS.counters.get("retry.single_item.attempts", 0)
+        + RUNTIME_METRICS.counters.get("retry.ass_surgical.attempts", 0)
+        + RUNTIME_METRICS.counters.get("retry.repair_batch.attempts", 0)
+    )
+    if retry_attempts:
+        cprint(
+            console,
+            (
+                "Retry counters: "
+                f"temp0_batches={RUNTIME_METRICS.counters.get('retry.batch_temp0.attempts', 0)} "
+                f"(items={RUNTIME_METRICS.counters.get('retry.batch_temp0.items', 0)}), "
+                f"srt_linewise={RUNTIME_METRICS.counters.get('retry.srt_linewise.attempts', 0)} "
+                f"(lines={RUNTIME_METRICS.counters.get('retry.srt_linewise.lines', 0)}), "
+                f"single={RUNTIME_METRICS.counters.get('retry.single_item.attempts', 0)}, "
+                f"ass_surgical={RUNTIME_METRICS.counters.get('retry.ass_surgical.attempts', 0)} "
+                f"(items={RUNTIME_METRICS.counters.get('retry.ass_surgical.items', 0)}), "
+                f"repair_batch={RUNTIME_METRICS.counters.get('retry.repair_batch.attempts', 0)} "
+                f"(items={RUNTIME_METRICS.counters.get('retry.repair_batch.items', 0)})"
+            ),
+            "cyan",
+        )
+
+
 def read_text(path: Path) -> Tuple[str, str, bool, bool]:
     data = path.read_bytes()
     has_bom = data.startswith(b"\xef\xbb\xbf")
@@ -229,41 +303,45 @@ def summarize_subs(
 ) -> str:
     if not lines:
         return ""
-    chunks = build_chunks(lines, max_chars)
-    summaries = []
-    system_msg = (
-        "You summarize subtitles. Write a concise summary in Spanish. "
-        "Keep it short and factual."
-    )
-    with progress_bar(console) as progress:
-        task_id = progress.add_task("Summary", total=len(chunks))
-        for chunk in chunks:
-            user_msg = (
-                "Summarize the following subtitle text in Spanish. "
-                "Keep it short (6-8 sentences max).\n\n" + chunk
-            )
-            content = client.chat(
+    with RUNTIME_METRICS.timed("summary.total"):
+        chunks = build_chunks(lines, max_chars)
+        RUNTIME_METRICS.bump("summary.chunks", len(chunks))
+        summaries = []
+        system_msg = (
+            "You summarize subtitles. Write a concise summary in Spanish. "
+            "Keep it short and factual."
+        )
+        with progress_bar(console) as progress:
+            task_id = progress.add_task("Summary", total=len(chunks))
+            for chunk in chunks:
+                user_msg = (
+                    "Summarize the following subtitle text in Spanish. "
+                    "Keep it short (6-8 sentences max).\n\n" + chunk
+                )
+                with RUNTIME_METRICS.timed("summary.chat.chunk"):
+                    content = client.chat(
+                        [
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        options=options,
+                    )
+                summaries.append(content.strip())
+                progress.advance(task_id, 1)
+        if len(summaries) == 1:
+            return summaries[0]
+        user_msg = (
+            "Combine these partial summaries into a single short summary in Spanish. "
+            "Avoid repetition.\n\n" + "\n\n".join(summaries)
+        )
+        with RUNTIME_METRICS.timed("summary.chat.merge"):
+            return client.chat(
                 [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 options=options,
-            )
-            summaries.append(content.strip())
-            progress.advance(task_id, 1)
-    if len(summaries) == 1:
-        return summaries[0]
-    user_msg = (
-        "Combine these partial summaries into a single short summary in Spanish. "
-        "Avoid repetition.\n\n" + "\n\n".join(summaries)
-    )
-    return client.chat(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        options=options,
-    ).strip()
+            ).strip()
 
 
 def build_tone_guide(
@@ -287,13 +365,15 @@ def build_tone_guide(
         f"Sample lines:\n{sample}"
     )
     cprint(console, "Building tone guide...", "bold cyan")
-    content = client.chat(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        options=options,
-    )
+    with RUNTIME_METRICS.timed("tone_guide.total"):
+        with RUNTIME_METRICS.timed("tone_guide.chat"):
+            content = client.chat(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                options=options,
+            )
     data = extract_json_object(content)
     if not data:
         guide = content.strip()
@@ -580,6 +660,7 @@ def guarded_translate_one(
     source_for_checks: str | None = None,
     validator=None,
     prefer_no_context: bool = False,
+    chat_timing_label: str = "translate.chat.single",
 ) -> str | None:
     source_check = source_for_checks if source_for_checks is not None else text
     if prefer_no_context:
@@ -598,7 +679,15 @@ def guarded_translate_one(
         )
         candidate = SINGLE_TRANSLATION_CACHE.get(cache_key)
         if candidate is None:
-            candidate = translate_one(client, text, sum_ctx, tone_ctx, target_lang, options)
+            candidate = translate_one(
+                client,
+                text,
+                sum_ctx,
+                tone_ctx,
+                target_lang,
+                options,
+                chat_timing_label=chat_timing_label,
+            )
             SINGLE_TRANSLATION_CACHE[cache_key] = candidate
         if not candidate:
             continue
@@ -714,13 +803,14 @@ def translate_batch(
         "Return ONLY a JSON array of strings, same length and order.\n\n"
         f"Input JSON: {json.dumps(texts, ensure_ascii=False)}"
     )
-    content = client.chat(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        options=options,
-    )
+    with RUNTIME_METRICS.timed("translate.chat.batch_legacy"):
+        content = client.chat(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            options=options,
+        )
     return extract_json_array(content)
 
 
@@ -731,6 +821,7 @@ def translate_one(
     tone_guide: str,
     target_lang: str,
     options,
+    chat_timing_label: str = "translate.chat.single",
 ) -> str:
     summary_short = summary.strip()
     if len(summary_short) > 1200:
@@ -762,13 +853,14 @@ def translate_one(
         "Respect sarcasm, double meanings, and register (formal/informal) as guided; do not neutralize tone.\n\n"
         f"Text: {text}"
     )
-    return client.chat(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        options=options,
-    ).strip()
+    with RUNTIME_METRICS.timed(chat_timing_label):
+        return client.chat(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            options=options,
+        ).strip()
 
 
 def repair_batch(
@@ -781,6 +873,8 @@ def repair_batch(
 ) -> List[str | None]:
     if not items:
         return []
+    RUNTIME_METRICS.bump("retry.repair_batch.attempts")
+    RUNTIME_METRICS.bump("retry.repair_batch.items", len(items))
     include_context = len(items) <= 3
     summary_short = summary.strip()[:240] if include_context and summary else ""
     tone_short = tone_guide.strip()[:160] if include_context and tone_guide else ""
@@ -824,10 +918,11 @@ def repair_batch(
         if not chunk_items:
             return []
         try:
-            content = client.chat(
-                build_messages(chunk_items),
-                options=build_repair_options(len(chunk_items)),
-            )
+            with RUNTIME_METRICS.timed("retry.chat.repair_batch"):
+                content = client.chat(
+                    build_messages(chunk_items),
+                    options=build_repair_options(len(chunk_items)),
+                )
         except OllamaTimeoutError:
             if len(chunk_items) == 1:
                 return [None]
@@ -1104,6 +1199,7 @@ def translate_json_batch(
     mode: str,
     rolling_context: str = "",
     force_temperature_zero: bool = False,
+    timing_label: str = "translate.chat.batch_json",
 ) -> List[str] | None:
     if not texts:
         return []
@@ -1121,7 +1217,8 @@ def translate_json_batch(
         texts=texts,
         force_temperature_zero=force_temperature_zero,
     )
-    content = client.chat(messages, options=options_batch, format=schema)
+    with RUNTIME_METRICS.timed(timing_label):
+        content = client.chat(messages, options=options_batch, format=schema)
     return parse_array_response(content, len(texts))
 
 
@@ -1135,6 +1232,7 @@ def translate_json_batch_with_split(
     mode: str,
     rolling_context: str = "",
     force_temperature_zero: bool = False,
+    timing_label: str = "translate.chat.batch_json",
 ) -> List[str | None]:
     if not texts:
         return []
@@ -1149,6 +1247,7 @@ def translate_json_batch_with_split(
             mode=mode,
             rolling_context=rolling_context,
             force_temperature_zero=force_temperature_zero,
+            timing_label=timing_label,
         )
     except OllamaTimeoutError:
         out = None
@@ -1174,6 +1273,7 @@ def translate_json_batch_with_split(
         mode=mode,
         rolling_context=rolling_context,
         force_temperature_zero=force_temperature_zero,
+        timing_label=timing_label,
     )
     right = translate_json_batch_with_split(
         client,
@@ -1185,6 +1285,7 @@ def translate_json_batch_with_split(
         mode=mode,
         rolling_context=rolling_context,
         force_temperature_zero=force_temperature_zero,
+        timing_label=timing_label,
     )
     return left + right
 
@@ -1549,14 +1650,15 @@ def translate_ass_slots_single(
     try:
         schema = build_fixed_array_schema(len(slots))
         options_batch = build_options_for_batch(options, slots)
-        content = client.chat(
-            [
-                {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
-                {"role": "user", "content": user_msg},
-            ],
-            options=options_batch,
-            format=schema,
-        )
+        with RUNTIME_METRICS.timed("retry.chat.ass_slot_single"):
+            content = client.chat(
+                [
+                    {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                    {"role": "user", "content": user_msg},
+                ],
+                options=options_batch,
+                format=schema,
+            )
     except OllamaTimeoutError:
         return None
     except RuntimeError as exc:
@@ -1615,14 +1717,15 @@ def translate_ass_slots_batch_with_split(
             options,
             [json.dumps(entry, ensure_ascii=False) for entry in payload],
         )
-        content = client.chat(
-            [
-                {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
-                {"role": "user", "content": user_msg},
-            ],
-            options=options_batch,
-            format=schema,
-        )
+        with RUNTIME_METRICS.timed("retry.chat.ass_slot_batch"):
+            content = client.chat(
+                [
+                    {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                    {"role": "user", "content": user_msg},
+                ],
+                options=options_batch,
+                format=schema,
+            )
     except OllamaTimeoutError:
         content = None
     except RuntimeError as exc:
@@ -1673,6 +1776,8 @@ def run_ass_surgical_fallback(
 ) -> None:
     if not failed_items:
         return
+    RUNTIME_METRICS.bump("retry.ass_surgical.attempts")
+    RUNTIME_METRICS.bump("retry.ass_surgical.items", len(failed_items))
     total = len(failed_items)
     if total <= 6:
         for item in failed_items:
@@ -1705,7 +1810,9 @@ def fallback_srt_linewise(
     target_lang: str,
     options,
 ) -> str | None:
+    RUNTIME_METRICS.bump("retry.srt_linewise.attempts")
     source_lines = item["original_text_field"].split("\n")
+    RUNTIME_METRICS.bump("retry.srt_linewise.lines", len(source_lines))
     out_lines = translate_json_batch_with_split(
         client,
         source_lines,
@@ -1715,6 +1822,7 @@ def fallback_srt_linewise(
         options,
         mode="srt_block",
         rolling_context="",
+        timing_label="retry.chat.srt_linewise",
     )
     if len(out_lines) != len(source_lines):
         return None
@@ -1738,6 +1846,7 @@ def retry_single_item_translation(
     options,
     mode: str,
 ) -> str | None:
+    RUNTIME_METRICS.bump("retry.single_item.attempts")
     out = translate_json_batch_with_split(
         client,
         [source_text],
@@ -1748,6 +1857,7 @@ def retry_single_item_translation(
         mode=mode,
         rolling_context="",
         force_temperature_zero=True,
+        timing_label="retry.chat.single_item",
     )
     if not out or out[0] is None:
         return None
@@ -1766,6 +1876,8 @@ def retry_failed_items_batch(
     """Reintenta en batch (temp=0 + schema) para evitar N llamadas 1x1 cuando el batch salió muy mal."""
     if not failed_items:
         return
+    RUNTIME_METRICS.bump("retry.batch_temp0.attempts")
+    RUNTIME_METRICS.bump("retry.batch_temp0.items", len(failed_items))
     sources = [it["protected_text"] for it in failed_items]
     out = translate_json_batch_with_split(
         client,
@@ -1777,6 +1889,7 @@ def retry_failed_items_batch(
         mode=mode,
         rolling_context="",
         force_temperature_zero=True,
+        timing_label="retry.chat.batch_temp0",
     )
     for it, cand in zip(failed_items, out):
         if cand is None:
@@ -2198,6 +2311,7 @@ def translate_ass_segment(
                 source_for_checks=source_token,
                 validator=lambda cand, src=source_token: scan_ass_segment_candidate(src, cand, target_lang)["ok"],
                 prefer_no_context=True,
+                chat_timing_label="retry.chat.segment_single",
             )
             if retry is not None:
                 retry = strip_label_prefix(retry)
@@ -2506,6 +2620,7 @@ def apply_fast_profile(args, console) -> None:
 
 def main() -> int:
     console = get_console()
+    RUNTIME_METRICS.reset()
     parser = argparse.ArgumentParser(description="Translate .ASS/.SRT subtitles using local Ollama.")
     parser.add_argument("--in", dest="in_path", help="Input subtitle file")
     parser.add_argument("--out", dest="out_path", help="Output subtitle file")
@@ -2571,66 +2686,72 @@ def main() -> int:
     if args.num_gpu is not None:
         options["num_gpu"] = args.num_gpu
     client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
+    start_total = time.perf_counter()
 
     # Build summary first
     summary = ""
     tone_guide = ""
     if not args.skip_summary:
         cprint(console, "Building summary...", "bold cyan")
-        if ext == ".ass":
-            plain_lines = collect_plain_lines_ass(text)
-        elif ext == ".srt":
-            plain_lines = collect_plain_lines_srt(text)
-        else:
-            print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
-            return 2
-        summary = summarize_subs(client, plain_lines, args.summary_chars, options, console)
+        with RUNTIME_METRICS.timed("stage.summary"):
+            if ext == ".ass":
+                plain_lines = collect_plain_lines_ass(text)
+            elif ext == ".srt":
+                plain_lines = collect_plain_lines_srt(text)
+            else:
+                print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
+                return 2
+            summary = summarize_subs(client, plain_lines, args.summary_chars, options, console)
         cprint(console, "Summary ready.", "bold green")
-        tone_guide = build_tone_guide(client, summary, plain_lines, options, console)
+        with RUNTIME_METRICS.timed("stage.tone_guide"):
+            tone_guide = build_tone_guide(client, summary, plain_lines, options, console)
         if tone_guide:
             cprint(console, "Tone guide ready.", "bold green")
 
     cprint(console, "Translating...", "bold cyan")
-    start = time.time()
-    if ext == ".ass":
-        out_text, translated_count = translate_ass(
-            client,
-            text,
-            summary,
-            tone_guide,
-            args.target,
-            args.batch_size,
-            options,
-            args.limit,
-            console,
-            args.ass_mode,
-            args.one_shot,
-            args.rolling_context,
-        )
-    elif ext == ".srt":
-        out_text, translated_count = translate_srt(
-            client,
-            text,
-            summary,
-            tone_guide,
-            args.target,
-            args.batch_size,
-            options,
-            args.limit,
-            console,
-            args.one_shot,
-            args.rolling_context,
-        )
-    else:
-        print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
-        return 2
+    with RUNTIME_METRICS.timed("stage.translate"):
+        if ext == ".ass":
+            out_text, translated_count = translate_ass(
+                client,
+                text,
+                summary,
+                tone_guide,
+                args.target,
+                args.batch_size,
+                options,
+                args.limit,
+                console,
+                args.ass_mode,
+                args.one_shot,
+                args.rolling_context,
+            )
+        elif ext == ".srt":
+            out_text, translated_count = translate_srt(
+                client,
+                text,
+                summary,
+                tone_guide,
+                args.target,
+                args.batch_size,
+                options,
+                args.limit,
+                console,
+                args.one_shot,
+                args.rolling_context,
+            )
+        else:
+            print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
+            return 2
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_text(out_path, out_text.splitlines(), line_ending, final_newline, bom)
-    elapsed = time.time() - start
+    translate_elapsed = RUNTIME_METRICS.seconds.get("stage.translate", 0.0)
+    total_elapsed = time.perf_counter() - start_total
     cprint(console, f"Translated blocks: {translated_count}", "bold green")
     cprint(console, f"Output written to: {out_path}", "bold green")
-    cprint(console, f"Elapsed: {elapsed:.1f}s", "bold green")
+    cprint(console, f"Elapsed (translate): {translate_elapsed:.1f}s", "bold green")
+    cprint(console, f"Elapsed (total): {total_elapsed:.1f}s", "bold green")
+    print_runtime_breakdown(console, total_elapsed)
     return 0
 
 
