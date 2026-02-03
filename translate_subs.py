@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import socket
 import subprocess
 import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple, TypeVar
 from urllib import request, error
 
 try:
@@ -34,7 +36,14 @@ except ImportError:
 
 ASS_TAG_RE = re.compile(r"(\{[^}]*\}|\\N|\\n|\\h)")
 ASS_STRIP_RE = re.compile(r"\{[^}]*\}")
-ASS_PLACEHOLDER_TOKEN_RE = re.compile(r"__ASS_TAG_\d+__")
+PLACEHOLDER_TOKEN_RE = re.compile(r"__TAG_\d+__")
+LEGACY_PLACEHOLDER_RE = re.compile(r"__ASS_TAG_\d+__")
+BROKEN_PLACEHOLDER_RE = re.compile(r"__TAG_(?!\d+__)")
+LABEL_PREFIX_RE = re.compile(
+    r"^(?P<head>\s*(?:__TAG_\d+__\s*)*)(?P<label>ASS|SRT|SUBS?|CAPTION|DIALOGUE)\s*(?::|-)\s*",
+    flags=re.IGNORECASE,
+)
+SPANISH_MARKER_RE = re.compile(r"[áéíóúñüÁÉÍÓÚÑÜ]")
 SUMMARY_MARKERS = (
     "summary",
     "resumen",
@@ -56,6 +65,14 @@ ES_STOPWORDS = {
 }
 BULK_DIR_NAME = "SUBS_BULK"
 SINGLE_TRANSLATION_CACHE = {}
+REPAIR_BATCH_MAX = 8
+MAX_REPAIR_FALLBACK_LINES = 3
+DEFAULT_CTX_TOKENS = 4096
+DEFAULT_PREDICT_TOKENS = 256
+TRANSLATION_SUMMARY_MAX = 600
+TRANSLATION_TONE_MAX = 400
+ROLLING_CONTEXT_MAX_CHARS = 600
+T = TypeVar("T")
 
 
 class SimpleConsole:
@@ -131,29 +148,40 @@ def write_text(path: Path, lines: List[str], line_ending: str, final_newline: bo
     path.write_bytes(data)
 
 class OllamaClient:
-    def __init__(self, host: str, model: str, timeout: int) -> None:
+    def __init__(self, host: str, model: str, timeout: int, keep_alive: str | None = "10m") -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.keep_alive = keep_alive
 
-    def chat(self, messages, options=None) -> str:
+    def chat(self, messages, options=None, format=None) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
         }
+        if self.keep_alive:
+            payload["keep_alive"] = self.keep_alive
         if options:
             payload["options"] = options
+        if format is not None:
+            payload["format"] = format
         url = f"{self.host}/api/chat"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
         try:
             with request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
+        except socket.timeout as exc:
+            raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
+        except TimeoutError as exc:
+            raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
         except error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
             raise RuntimeError(
                 f"Cannot reach Ollama at {self.host}. Is it running?"
             ) from exc
@@ -162,6 +190,10 @@ class OllamaClient:
             return payload["message"]["content"]
         except Exception as exc:
             raise RuntimeError(f"Unexpected Ollama response: {body[:200]}") from exc
+
+
+class OllamaTimeoutError(RuntimeError):
+    pass
 
 
 def build_chunks(lines: List[str], max_chars: int) -> List[str]:
@@ -308,6 +340,29 @@ def extract_json_array(text: str) -> List[str] | None:
     return None
 
 
+def extract_json_array_of_arrays(text: str) -> List[List[str]] | None:
+    cleaned = text.strip()
+    cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    candidate = cleaned[start : end + 1]
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    out: List[List[str]] = []
+    for row in data:
+        if not isinstance(row, list):
+            return None
+        out.append([str(item) for item in row])
+    return out
+
+
 def extract_json_object(text: str) -> dict | None:
     cleaned = text.strip()
     cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE)
@@ -332,6 +387,84 @@ def count_words(text: str) -> int:
 
 def ascii_word_tokens(text: str) -> List[str]:
     return [t.lower() for t in re.findall(r"[A-Za-z']+", text)]
+
+
+def normalize_target_lang(target_lang: str) -> str:
+    lowered = target_lang.strip().lower()
+    if lowered in {"spanish", "es", "es-419", "es_419", "espanol"} or lowered.startswith("spanish"):
+        return "es"
+    if lowered in {"english", "en", "en-us", "en_us", "en-gb", "en_gb"} or lowered.startswith("english"):
+        return "en"
+    return lowered
+
+
+def has_label_prefix_artifact(text: str) -> bool:
+    return LABEL_PREFIX_RE.match(text or "") is not None
+
+
+def strip_label_prefix(text: str) -> str:
+    cleaned = text or ""
+    # Some models prepend labels repeatedly (e.g., "ASS: SRT: ...").
+    for _ in range(3):
+        match = LABEL_PREFIX_RE.match(cleaned)
+        if not match:
+            break
+        cleaned = f"{match.group('head')}{cleaned[match.end():]}"
+    return cleaned
+
+
+def has_target_language_leak(source: str, translated: str, target_lang: str) -> bool:
+    mode = normalize_target_lang(target_lang)
+    if mode not in {"es", "en"}:
+        return False
+    dst_tokens = ascii_word_tokens(translated)
+    if not dst_tokens:
+        return False
+
+    en_hits = sum(1 for token in dst_tokens if token in EN_STOPWORDS)
+    es_hits = sum(1 for token in dst_tokens if token in ES_STOPWORDS)
+    has_spanish_markers = bool(SPANISH_MARKER_RE.search(translated))
+    has_spanish_signal = has_spanish_markers or es_hits >= 2
+    has_english_signal = en_hits >= 2 or "i" in dst_tokens
+
+    if mode == "es":
+        # A standalone "I" in Spanish output is a strong incomplete-translation signal.
+        if "i" in dst_tokens:
+            return True
+        if en_hits >= 2 and not has_spanish_signal:
+            return True
+        return False
+
+    # Symmetric check when target is English.
+    if es_hits >= 2 and not has_english_signal:
+        return True
+    if has_spanish_markers and not has_english_signal:
+        src_tokens = set(ascii_word_tokens(source))
+        if not src_tokens.intersection({"senor", "senora", "senorita", "espanol"}):
+            return True
+    return False
+
+
+def is_very_suspicious_translation(source: str, translated: str) -> bool:
+    src = source.strip()
+    dst = translated.strip()
+    if not dst:
+        return True
+    src_words = count_words(src)
+    dst_words = count_words(dst)
+    src_len = len(src)
+    dst_len = len(dst)
+    dst_lower = dst.lower()
+
+    if src_words <= 4 and dst_words >= 35:
+        return True
+    if dst_words > max(60, src_words * 6):
+        return True
+    if dst_len > max(420, src_len * 6 + 120):
+        return True
+    if dst_words >= 25 and any(marker in dst_lower for marker in SUMMARY_MARKERS):
+        return True
+    return False
 
 
 def is_suspicious_translation(source: str, translated: str) -> bool:
@@ -384,8 +517,8 @@ def is_suspicious_translation(source: str, translated: str) -> bool:
 
 
 def ass_placeholders_match(source_protected: str, translated: str) -> bool:
-    expected = ASS_PLACEHOLDER_TOKEN_RE.findall(source_protected)
-    actual = ASS_PLACEHOLDER_TOKEN_RE.findall(translated)
+    expected = PLACEHOLDER_TOKEN_RE.findall(source_protected)
+    actual = PLACEHOLDER_TOKEN_RE.findall(translated)
     return expected == actual
 
 
@@ -398,7 +531,11 @@ def ass_structure_preserved(source: str, translated: str) -> bool:
 
 
 def has_placeholder_artifacts(text: str) -> bool:
-    return "ASS_TAG" in text
+    if not text:
+        return False
+    if LEGACY_PLACEHOLDER_RE.search(text):
+        return True
+    return BROKEN_PLACEHOLDER_RE.search(text) is not None
 
 
 def guarded_translate_one(
@@ -433,11 +570,16 @@ def guarded_translate_one(
             SINGLE_TRANSLATION_CACHE[cache_key] = candidate
         if not candidate:
             continue
-        if has_placeholder_artifacts(candidate) and "__ASS_TAG_" not in text:
+        candidate = strip_label_prefix(candidate)
+        if has_label_prefix_artifact(candidate):
+            continue
+        if has_placeholder_artifacts(candidate) and "__TAG_" not in text:
             continue
         if not ass_placeholders_match(text, candidate):
             continue
         if validator and not validator(candidate):
+            continue
+        if has_target_language_leak(source_check, candidate, target_lang):
             continue
         if is_suspicious_translation(source_check, candidate):
             continue
@@ -473,9 +615,12 @@ def translate_ass_text_field_segmented(
     for (idx, source), candidate in zip(segments, batch_out):
         fixed = None
         if candidate:
+            candidate = strip_label_prefix(candidate)
             if (
                 not has_ass_markup(candidate)
                 and not has_placeholder_artifacts(candidate)
+                and not has_label_prefix_artifact(candidate)
+                and not has_target_language_leak(source, candidate, target_lang)
                 and not is_suspicious_translation(source, candidate)
             ):
                 fixed = candidate
@@ -488,7 +633,10 @@ def translate_ass_text_field_segmented(
             target_lang,
             options,
             source_for_checks=source,
-            validator=lambda cand: not has_ass_markup(cand) and not has_placeholder_artifacts(cand),
+            validator=lambda cand, src=source: not has_ass_markup(cand)
+            and not has_placeholder_artifacts(cand)
+            and not has_label_prefix_artifact(cand)
+            and not has_target_language_leak(src, cand, target_lang),
             prefer_no_context=True,
         ) if fixed is None else fixed
         tokens[idx] = safe if safe is not None else source
@@ -509,11 +657,11 @@ def translate_batch(
     tone_short = tone_guide.strip()
     if len(tone_short) > 800:
         tone_short = tone_short[:800] + "..."
-    has_placeholders = any("__ASS_TAG_" in item for item in texts)
+    has_placeholders = any("__TAG_" in item for item in texts)
     placeholder_rule = (
-        "If placeholders like __ASS_TAG_0__ appear, keep them exactly. "
+        "If placeholders like __TAG_0__ appear, keep them exactly. "
         if has_placeholders
-        else "Do not introduce placeholders like __ASS_TAG_0__ if they are not in the source. "
+        else "Do not introduce placeholders like __TAG_0__ if they are not in the source. "
     )
     system_msg = (
         "You are a professional subtitle translator. "
@@ -526,6 +674,7 @@ def translate_batch(
         f"Tone guide (apply per line): {tone_short}\n"
         f"Translate each item in the JSON array from English to {target_lang}. "
         "Keep line breaks. Keep ASS tags in braces and control codes \\N, \\n, \\h unchanged. "
+        "Never prepend labels like ASS:, SRT:, SUB:, or Dialogue:. "
         "Translate only the current line, never summarize a scene or multiple lines. "
         "Fully translate every word from the source; do not drop connectors or leave source fragments. "
         f"{placeholder_rule}"
@@ -557,11 +706,11 @@ def translate_one(
     tone_short = tone_guide.strip()
     if len(tone_short) > 800:
         tone_short = tone_short[:800] + "..."
-    has_placeholders = "__ASS_TAG_" in text
+    has_placeholders = "__TAG_" in text
     placeholder_rule = (
-        "If placeholders like __ASS_TAG_0__ appear, keep them exactly.\n\n"
+        "If placeholders like __TAG_0__ appear, keep them exactly.\n\n"
         if has_placeholders
-        else "Do not introduce placeholders like __ASS_TAG_0__ if they are not in the source.\n\n"
+        else "Do not introduce placeholders like __TAG_0__ if they are not in the source.\n\n"
     )
     system_msg = (
         "You are a professional subtitle translator. "
@@ -574,6 +723,7 @@ def translate_one(
         f"Tone guide (apply per line): {tone_short}\n"
         f"Translate to {target_lang}. Return ONLY the translated text. "
         "Keep ASS tags in braces and control codes \\N, \\n, \\h unchanged. "
+        "Never prepend labels like ASS:, SRT:, SUB:, or Dialogue:. "
         "Translate only this line, never summarize the plot or add narration. "
         "Fully translate every word from the source; do not drop connectors or leave source fragments. "
         f"{placeholder_rule}"
@@ -589,7 +739,88 @@ def translate_one(
     ).strip()
 
 
-def batched(items: List[str], size: int) -> List[List[str]]:
+def repair_batch(
+    client: OllamaClient,
+    items: List[dict],
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+) -> List[str | None]:
+    if not items:
+        return []
+    include_context = len(items) <= 3
+    summary_short = summary.strip()[:240] if include_context and summary else ""
+    tone_short = tone_guide.strip()[:160] if include_context and tone_guide else ""
+
+    def build_messages(chunk_items: List[dict]):
+        payload_items = []
+        for item in chunk_items:
+            payload_items.append(
+                {
+                    "src": str(item.get("src", "")),
+                    "bad": str(item.get("bad", "")),
+                }
+            )
+        user_msg = (
+            f"Fix each `bad` subtitle so it is correct {target_lang}.\n"
+            "Rules:\n"
+            "- Never prepend labels like ASS:, SRT:, SUB:, SUBS:, CAPTION:, Dialogue:.\n"
+            "- Fully translate remaining English fragments.\n"
+            "- Keep placeholders __TAG_n__ exactly as in src (same count/order).\n"
+            "- Do not add ASS tags/braces/control codes not present in src.\n"
+            "- Output ONLY JSON array of strings, same order/length.\n"
+        )
+        if summary_short:
+            user_msg += f"Summary hint: {summary_short}\n"
+        if tone_short:
+            user_msg += f"Tone hint: {tone_short}\n"
+        user_msg += f"Input JSON: {json.dumps(payload_items, ensure_ascii=False)}"
+        return [
+            {"role": "system", "content": "You are a subtitle translation fixer. Output ONLY JSON."},
+            {"role": "user", "content": user_msg},
+        ]
+
+    def build_repair_options(chunk_len: int):
+        repair_options = dict(options or {})
+        max_predict = min(512, max(128, chunk_len * 128))
+        if repair_options.get("num_predict") is None or int(repair_options["num_predict"]) > max_predict:
+            repair_options["num_predict"] = max_predict
+        return repair_options
+
+    def repair_chunk_with_split(chunk_items: List[dict]) -> List[str | None]:
+        if not chunk_items:
+            return []
+        try:
+            content = client.chat(
+                build_messages(chunk_items),
+                options=build_repair_options(len(chunk_items)),
+            )
+        except OllamaTimeoutError:
+            if len(chunk_items) == 1:
+                return [None]
+            mid = max(1, len(chunk_items) // 2)
+            return repair_chunk_with_split(chunk_items[:mid]) + repair_chunk_with_split(chunk_items[mid:])
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "timed out" in msg and len(chunk_items) > 1:
+                mid = max(1, len(chunk_items) // 2)
+                return repair_chunk_with_split(chunk_items[:mid]) + repair_chunk_with_split(chunk_items[mid:])
+            return [None] * len(chunk_items)
+        out = extract_json_array(content)
+        if out is None or len(out) != len(chunk_items):
+            return [None] * len(chunk_items)
+        return [strip_label_prefix(item) for item in out]
+
+    fixed: List[str | None] = []
+    for chunk in batched(items, REPAIR_BATCH_MAX):
+        fixed.extend(repair_chunk_with_split(chunk))
+    if len(fixed) != len(items):
+        return [None] * len(items)
+    return fixed
+
+
+def batched(items: List[T], size: int) -> List[List[T]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
@@ -606,7 +837,7 @@ def ass_protect_tags(text: str) -> Tuple[str, List[Tuple[str, str]]]:
     replacements: List[Tuple[str, str]] = []
 
     def repl(match: re.Match) -> str:
-        key = f"__ASS_TAG_{len(replacements)}__"
+        key = f"__TAG_{len(replacements)}__"
         replacements.append((key, match.group(0)))
         return key
 
@@ -627,125 +858,445 @@ def ass_plain_text(text: str) -> str:
     return text
 
 
-def translate_srt(
-    client: OllamaClient,
-    text: str,
-    summary: str,
-    tone_guide: str,
-    target_lang: str,
+def trim_translation_context(summary: str, tone_guide: str) -> Tuple[str, str]:
+    summary_short = (summary or "").strip()
+    tone_short = (tone_guide or "").strip()
+    if len(summary_short) > TRANSLATION_SUMMARY_MAX:
+        summary_short = summary_short[:TRANSLATION_SUMMARY_MAX].rstrip() + "..."
+    if len(tone_short) > TRANSLATION_TONE_MAX:
+        tone_short = tone_short[:TRANSLATION_TONE_MAX].rstrip() + "..."
+    return summary_short, tone_short
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    return max(1, int(math.ceil(len(text or "") / 4.0)))
+
+
+def translation_budget(options) -> Tuple[int, int]:
+    opts = options or {}
+    num_ctx = int(opts.get("num_ctx") or DEFAULT_CTX_TOKENS)
+    num_predict = int(opts.get("num_predict") or DEFAULT_PREDICT_TOKENS)
+    budget = max(256, int(math.floor(num_ctx * 0.85)))
+    reserve_out = min(num_predict, int(math.floor(num_ctx * 0.35)))
+    reserve_out = max(64, reserve_out)
+    return budget, reserve_out
+
+
+def build_fixed_array_schema(size: int) -> dict:
+    return {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": size,
+        "maxItems": size,
+    }
+
+
+def build_fixed_array_of_arrays_schema(size: int) -> dict:
+    return {
+        "type": "array",
+        "items": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "minItems": size,
+        "maxItems": size,
+    }
+
+
+def parse_array_response(content: str, expected_len: int) -> List[str] | None:
+    cleaned = content.strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list) and len(data) == expected_len:
+            return [str(item) for item in data]
+    except json.JSONDecodeError:
+        pass
+    fallback = extract_json_array(content)
+    if fallback is not None and len(fallback) == expected_len:
+        return fallback
+    return None
+
+
+def parse_array_of_arrays_response(content: str, expected_len: int) -> List[List[str]] | None:
+    cleaned = content.strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list) and len(data) == expected_len and all(isinstance(row, list) for row in data):
+            return [[str(item) for item in row] for row in data]
+    except json.JSONDecodeError:
+        pass
+    fallback = extract_json_array_of_arrays(content)
+    if fallback is not None and len(fallback) == expected_len:
+        return fallback
+    return None
+
+
+def build_options_for_batch(options, texts: List[str], force_temperature_zero: bool = False) -> dict:
+    options_batch = dict(options or {})
+    num_ctx = int(options_batch.get("num_ctx") or DEFAULT_CTX_TOKENS)
+    in_tokens = sum(estimate_tokens_from_text(text) for text in texts)
+    est_out = int(math.ceil(in_tokens * 1.2)) + 64
+    cap = min(4096, int(math.floor(num_ctx * 0.45)))
+    base_predict = int(options_batch.get("num_predict") or 0)
+    desired_predict = max(base_predict, est_out)
+    if cap > 0:
+        desired_predict = min(desired_predict, cap)
+    options_batch["num_predict"] = max(64, desired_predict)
+    if force_temperature_zero:
+        options_batch["temperature"] = 0.0
+    return options_batch
+
+
+def rolling_context_snippet(history: List[str], size: int) -> str:
+    if size <= 0 or not history:
+        return ""
+    snippet = "\n".join(line for line in history[-size:] if line.strip())
+    if len(snippet) > ROLLING_CONTEXT_MAX_CHARS:
+        snippet = snippet[-ROLLING_CONTEXT_MAX_CHARS:]
+    return snippet
+
+
+def build_adaptive_batches(
+    items: List[dict],
     batch_size: int,
     options,
-    limit: int | None,
+    one_shot: bool,
     console,
-) -> Tuple[str, int]:
-    lines = text.splitlines()
-    blocks = []
-    cur = []
-    for line in lines:
-        if line.strip() == "":
-            if cur:
-                blocks.append(cur)
-                cur = []
-        else:
-            cur.append(line)
-    if cur:
-        blocks.append(cur)
+) -> List[List[dict]]:
+    if not items:
+        return []
+    budget, reserve_out = translation_budget(options)
+    cap = len(items) if batch_size is None or int(batch_size) <= 0 else max(1, int(batch_size))
+    est_total = sum(item.get("in_tokens", estimate_tokens_from_text(item.get("protected_text", ""))) for item in items)
+    if est_total + reserve_out <= budget and len(items) <= cap:
+        return [items]
 
-    trans_targets = []
-    trans_map = []
-    count = 0
-    for idx, block in enumerate(blocks):
-        if len(block) < 2:
-            continue
-        if limit is not None and count >= limit:
-            continue
-        count += 1
-        text_lines = block[2:] if len(block) > 2 else [""]
-        joined = "\n".join(text_lines)
-        trans_map.append((idx, joined))
-        trans_targets.append(joined)
-
-    translations = []
-    if trans_targets:
-        with progress_bar(console) as progress:
-            task_id = progress.add_task("Translation", total=len(trans_targets))
-            for batch in batched(trans_targets, batch_size):
-                out = translate_batch(client, batch, summary, tone_guide, target_lang, options)
-                if out is None or len(out) != len(batch):
-                    out = []
-                    for item in batch:
-                        out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
-                translations.extend(out)
-                progress.advance(task_id, len(batch))
-        cprint(console, "Applying quality checks...", "cyan")
-
-    for (block_idx, source_text), translated in zip(trans_map, translations):
-        fixed = translated
-        needs_retry = (
-            is_suspicious_translation(source_text, translated)
-            or not ass_placeholders_match(source_text, translated)
-        )
-        if needs_retry:
-            retry = guarded_translate_one(
-                client,
-                source_text,
-                summary,
-                tone_guide,
-                target_lang,
-                options,
-                source_for_checks=source_text,
-                prefer_no_context=True,
+    if one_shot:
+        if len(items) > cap:
+            cprint(
+                console,
+                f"--one-shot requested but batch-size={cap} < items={len(items)}; using adaptive batches.",
+                "yellow",
             )
-            fixed = retry if retry is not None else source_text
-        block = blocks[block_idx]
-        new_lines = fixed.split("\n") if fixed else [""]
-        blocks[block_idx] = [block[0], block[1], *new_lines]
+        elif est_total + reserve_out <= budget:
+            return [items]
+        else:
+            cprint(
+                console,
+                "--one-shot requested but estimated prompt does not fit num_ctx; using adaptive batches.",
+                "yellow",
+            )
 
-    out_lines = []
-    for i, block in enumerate(blocks):
-        out_lines.extend(block)
-        if i != len(blocks) - 1:
-            out_lines.append("")
+    batches: List[List[dict]] = []
+    cur: List[dict] = []
+    cur_tokens = 0
+    for item in items:
+        in_tokens = item.get("in_tokens", estimate_tokens_from_text(item.get("protected_text", "")))
+        if not cur:
+            cur = [item]
+            cur_tokens = in_tokens
+            continue
+        fits_tokens = (cur_tokens + in_tokens + reserve_out) <= budget
+        fits_count = len(cur) < cap
+        if fits_tokens and fits_count:
+            cur.append(item)
+            cur_tokens += in_tokens
+            continue
+        batches.append(cur)
+        cur = [item]
+        cur_tokens = in_tokens
+    if cur:
+        batches.append(cur)
+    return batches
 
-    return "\n".join(out_lines), count
+
+def build_translation_messages(
+    texts: List[str],
+    target_lang: str,
+    summary: str,
+    tone_guide: str,
+    mode: str,
+    rolling_context: str = "",
+) -> List[dict]:
+    summary_short, tone_short = trim_translation_context(summary, tone_guide)
+    context_lines = []
+    if summary_short:
+        context_lines.append(f"Summary hint: {summary_short}")
+    if tone_short:
+        context_lines.append(f"Tone hint: {tone_short}")
+    if rolling_context:
+        context_lines.append(f"Recent translated lines: {rolling_context}")
+    context_blob = "\n".join(context_lines)
+
+    if mode == "ass_protected":
+        user_msg = (
+            f"Translate each item from English to {target_lang}.\n"
+            "Rules:\n"
+            "1) Preserve placeholders like __TAG_0__ exactly (same count/order).\n"
+            "2) Do NOT introduce labels such as ASS:, SRT:, Dialogue:.\n"
+            "3) Do NOT add braces/tags/control codes. Translate only natural language.\n"
+            "4) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
+            "5) Output ONLY a JSON array of strings, same length/order.\n"
+        )
+    else:
+        user_msg = (
+            f"Translate each subtitle block from English to {target_lang}.\n"
+            "Rules:\n"
+            "1) Keep line breaks in each item.\n"
+            "2) Do NOT introduce labels such as ASS:, SRT:, Dialogue:.\n"
+            "3) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
+            "4) Output ONLY a JSON array of strings, same length/order.\n"
+        )
+
+    if context_blob:
+        user_msg += context_blob + "\n"
+    user_msg += f"Input JSON: {json.dumps(texts, ensure_ascii=False)}"
+    return [
+        {
+            "role": "system",
+            "content": "You are a professional subtitle translator. Output only valid JSON.",
+        },
+        {"role": "user", "content": user_msg},
+    ]
 
 
-def translate_ass(
+def translate_json_batch(
     client: OllamaClient,
-    text: str,
+    texts: List[str],
     summary: str,
     tone_guide: str,
     target_lang: str,
-    batch_size: int,
     options,
-    limit: int | None,
-    console,
-    ass_mode: str = "line",
-) -> Tuple[str, int]:
-    if ass_mode == "segment":
-        return translate_ass_segment(
+    mode: str,
+    rolling_context: str = "",
+    force_temperature_zero: bool = False,
+) -> List[str] | None:
+    if not texts:
+        return []
+    messages = build_translation_messages(
+        texts=texts,
+        target_lang=target_lang,
+        summary=summary,
+        tone_guide=tone_guide,
+        mode=mode,
+        rolling_context=rolling_context,
+    )
+    schema = build_fixed_array_schema(len(texts))
+    options_batch = build_options_for_batch(
+        options=options,
+        texts=texts,
+        force_temperature_zero=force_temperature_zero,
+    )
+    content = client.chat(messages, options=options_batch, format=schema)
+    return parse_array_response(content, len(texts))
+
+
+def translate_json_batch_with_split(
+    client: OllamaClient,
+    texts: List[str],
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+    mode: str,
+    rolling_context: str = "",
+    force_temperature_zero: bool = False,
+) -> List[str | None]:
+    if not texts:
+        return []
+    try:
+        out = translate_json_batch(
             client,
-            text,
+            texts,
             summary,
             tone_guide,
             target_lang,
-            batch_size,
             options,
-            limit,
-            console,
+            mode=mode,
+            rolling_context=rolling_context,
+            force_temperature_zero=force_temperature_zero,
         )
+    except OllamaTimeoutError:
+        out = None
+    except RuntimeError as exc:
+        if "timed out" in str(exc).lower():
+            out = None
+        else:
+            out = None
 
+    if out is not None and len(out) == len(texts):
+        return [strip_label_prefix(item) for item in out]
+    if len(texts) == 1:
+        return [None]
+
+    mid = max(1, len(texts) // 2)
+    left = translate_json_batch_with_split(
+        client,
+        texts[:mid],
+        summary,
+        tone_guide,
+        target_lang,
+        options,
+        mode=mode,
+        rolling_context=rolling_context,
+        force_temperature_zero=force_temperature_zero,
+    )
+    right = translate_json_batch_with_split(
+        client,
+        texts[mid:],
+        summary,
+        tone_guide,
+        target_lang,
+        options,
+        mode=mode,
+        rolling_context=rolling_context,
+        force_temperature_zero=force_temperature_zero,
+    )
+    return left + right
+
+
+def repair_issue_score(reasons: List[str]) -> int:
+    weights = {
+        "empty_output": 6,
+        "placeholder_mismatch": 6,
+        "placeholder_artifacts": 5,
+        "unexpected_ass_markup": 4,
+        "language_leak": 4,
+        "very_suspicious": 2,
+    }
+    return sum(weights.get(reason, 1) for reason in reasons)
+
+
+def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> dict:
+    cleaned = strip_label_prefix(candidate or "")
+    source_plain = ass_plain_text(state["text_field"])
+    placeholder_ok = ass_placeholders_match(state["protected"], cleaned)
+    markup_found = has_ass_markup(cleaned)
+    placeholder_artifact_found = has_placeholder_artifacts(cleaned)
+    restored = ass_restore_tags(cleaned, state["replacements"])
+    restored_plain = ass_plain_text(restored)
+    reasons = []
+    if not cleaned.strip() or not restored_plain.strip():
+        reasons.append("empty_output")
+    if not placeholder_ok:
+        reasons.append("placeholder_mismatch")
+    if markup_found:
+        reasons.append("unexpected_ass_markup")
+    if placeholder_artifact_found or has_placeholder_artifacts(restored):
+        reasons.append("placeholder_artifacts")
+    if has_target_language_leak(source_plain, restored_plain, target_lang):
+        reasons.append("language_leak")
+    if is_very_suspicious_translation(source_plain, restored_plain):
+        reasons.append("very_suspicious")
+
+    ok = len(reasons) == 0
+    needs_llm_repair = any(
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "language_leak", "very_suspicious"}
+        for reason in reasons
+    )
+    return {
+        "ok": ok,
+        "candidate": cleaned,
+        "restored": restored,
+        "reasons": reasons,
+        "needs_llm_repair": needs_llm_repair,
+        "score": repair_issue_score(reasons),
+    }
+
+
+def scan_ass_segment_candidate(source_token: str, candidate: str, target_lang: str) -> dict:
+    cleaned = strip_label_prefix(candidate or "")
+    reasons = []
+    if not cleaned.strip():
+        reasons.append("empty_output")
+    if not ass_placeholders_match(source_token, cleaned):
+        reasons.append("placeholder_mismatch")
+    if has_ass_markup(cleaned):
+        reasons.append("unexpected_ass_markup")
+    if has_placeholder_artifacts(cleaned):
+        reasons.append("placeholder_artifacts")
+    if has_target_language_leak(source_token, cleaned, target_lang):
+        reasons.append("language_leak")
+    if is_very_suspicious_translation(source_token, cleaned):
+        reasons.append("very_suspicious")
+
+    ok = len(reasons) == 0
+    needs_llm_repair = any(
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "language_leak", "very_suspicious"}
+        for reason in reasons
+    )
+    return {
+        "ok": ok,
+        "candidate": cleaned,
+        "reasons": reasons,
+        "needs_llm_repair": needs_llm_repair,
+        "score": repair_issue_score(reasons),
+    }
+
+
+def self_test_ass_repair_snippet() -> None:
+    source_protected = "__TAG_0__ I couldn't make it\\N..."
+    bad_candidate = "ASS: I pude atender a\\N..."
+    cleaned_bad = strip_label_prefix(bad_candidate)
+    assert not has_label_prefix_artifact(cleaned_bad)
+    assert has_target_language_leak(source_protected, cleaned_bad, "Spanish")
+
+    fixed_candidate = "__TAG_0__ No pude llegar\\N..."
+    cleaned_fixed = strip_label_prefix(fixed_candidate)
+    assert not has_label_prefix_artifact(cleaned_fixed)
+    assert " i " not in f" {ass_plain_text(cleaned_fixed).lower()} "
+    assert not has_target_language_leak(source_protected, cleaned_fixed, "Spanish")
+
+    # Quick scan test: only the problematic "ASS: I ..." line should require LLM repair.
+    texts = [
+        "Hello there.",
+        "{\\i1}I couldn't make it\\N...",
+        "See you soon.",
+    ]
+    candidates = [
+        "Hola por ahi.",
+        "ASS: I pude atender a\\N...",
+        "Nos vemos pronto.",
+    ]
+    flagged = []
+    for idx, (text_field, cand) in enumerate(zip(texts, candidates)):
+        protected, replacements = ass_protect_tags(text_field)
+        state = {
+            "text_field": text_field,
+            "protected": protected,
+            "replacements": replacements,
+        }
+        status = scan_ass_line_candidate(state, cand, "Spanish")
+        if status["needs_llm_repair"]:
+            flagged.append(idx)
+    assert flagged == [1]
+
+
+def self_test_hybrid_pipeline() -> None:
+    assert strip_label_prefix("ASS: Hola") == "Hola"
+    src = "{\\i1}do{\\i0}\\Nnow"
+    protected, replacements = ass_protect_tags(src)
+    candidate = "__TAG_0__hacer__TAG_1____TAG_2__ahora"
+    assert ass_placeholders_match(protected, candidate)
+    restored = ass_restore_tags(candidate, replacements)
+    assert restored.startswith("{\\i1}")
+    assert "\\N" in restored
+    assert ass_structure_preserved(src, restored)
+    assert "ASS:" not in strip_label_prefix("ASS: traduccion correcta")
+    srt_source = {"original_text_field": "Hello\nthere", "expected_line_count": 2}
+    srt_status = scan_srt_candidate(srt_source, "Hola\nalli", "Spanish")
+    assert srt_status["ok"]
+
+
+def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
     lines = text.splitlines()
     in_events = False
     format_fields = None
     text_idx = None
-
-    trans_targets = []
-    trans_map = []
-    line_state = {}
+    items: List[dict] = []
     translated_count = 0
 
-    for i, line in enumerate(lines):
+    for line_idx, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("[Events]"):
             in_events = True
@@ -756,7 +1307,6 @@ def translate_ass(
             if "Text" in format_fields:
                 text_idx = format_fields.index("Text")
             continue
-
         if not in_events or format_fields is None or text_idx is None:
             continue
 
@@ -778,120 +1328,581 @@ def translate_ass(
         if not should_translate(text_field):
             continue
         protected, replacements = ass_protect_tags(text_field)
-        line_state[i] = {
-            "kind": kind,
+        tokens = split_ass_text(text_field)
+        item = {
+            "id": ("ass_dialogue", line_idx),
+            "kind": "ass_dialogue",
+            "line_idx": line_idx,
+            "dialogue_kind": kind,
             "spaces": spaces,
             "fields": fields,
+            "text_idx": text_idx,
+            "original_text_field": text_field,
+            "tokens": tokens,
+            "protected_text": protected,
             "text_field": text_field,
             "protected": protected,
             "replacements": replacements,
-            "text_idx": text_idx,
+            "in_tokens": estimate_tokens_from_text(protected),
         }
-        trans_map.append(i)
-        trans_targets.append(protected)
+        items.append(item)
         translated_count += 1
+    return lines, items
 
-    translations = []
-    if trans_targets:
-        with progress_bar(console) as progress:
-            task_id = progress.add_task("Translation", total=len(trans_targets))
-            for batch in batched(trans_targets, batch_size):
-                out = translate_batch(client, batch, summary, tone_guide, target_lang, options)
-                if out is None or len(out) != len(batch):
-                    out = []
-                    for item in batch:
-                        out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
-                translations.extend(out)
-                progress.advance(task_id, len(batch))
-        cprint(console, "Applying ASS safety checks...", "cyan")
 
-    for line_idx, translated in zip(trans_map, translations):
-        state = line_state.get(line_idx)
-        if not state:
+def parse_srt_ir(text: str, limit: int | None) -> Tuple[List[List[str]], List[dict]]:
+    lines = text.splitlines()
+    blocks: List[List[str]] = []
+    cur: List[str] = []
+    for line in lines:
+        if line.strip() == "":
+            if cur:
+                blocks.append(cur)
+                cur = []
             continue
-        placeholder_ok = ass_placeholders_match(state["protected"], translated)
-        protected_retry = None
-        did_retry_protected = False
-        if not placeholder_ok or has_ass_markup(translated):
-            protected_retry = guarded_translate_one(
-                client,
-                state["protected"],
-                summary,
-                tone_guide,
-                target_lang,
-                options,
-                source_for_checks=ass_plain_text(state["text_field"]),
-                validator=lambda cand, src=state["protected"]: ass_placeholders_match(src, cand)
-                and not has_ass_markup(cand),
-                prefer_no_context=True,
-            )
-            did_retry_protected = True
-            if protected_retry is not None:
-                translated = protected_retry
-                placeholder_ok = True
+        cur.append(line)
+    if cur:
+        blocks.append(cur)
 
-        if placeholder_ok:
-            restored = ass_restore_tags(translated, state["replacements"])
-            source_plain = ass_plain_text(state["text_field"])
-            restored_plain = ass_plain_text(restored)
-            structure_ok = ass_structure_preserved(state["text_field"], restored)
-            if (
-                not structure_ok
-                or has_placeholder_artifacts(restored)
-                or is_suspicious_translation(source_plain, restored_plain)
-            ):
-                retry = None
-                if not did_retry_protected:
-                    retry = guarded_translate_one(
-                        client,
-                        state["protected"],
-                        summary,
-                        tone_guide,
-                        target_lang,
-                        options,
-                        source_for_checks=source_plain,
-                        validator=lambda cand, src=state["protected"]: ass_placeholders_match(src, cand)
-                        and not has_ass_markup(cand),
-                        prefer_no_context=True,
-                    )
-                if retry is not None:
-                    restored = ass_restore_tags(retry, state["replacements"])
-                    if (
-                        not ass_structure_preserved(state["text_field"], restored)
-                        or has_placeholder_artifacts(restored)
-                        or is_suspicious_translation(source_plain, ass_plain_text(restored))
-                    ):
-                        restored = translate_ass_text_field_segmented(
-                            client,
-                            state["text_field"],
-                            summary,
-                            tone_guide,
-                            target_lang,
-                            options,
-                        )
-                else:
-                    restored = translate_ass_text_field_segmented(
-                        client,
-                        state["text_field"],
-                        summary,
-                        tone_guide,
-                        target_lang,
-                        options,
-                    )
+    items: List[dict] = []
+    translated_count = 0
+    for block_idx, block in enumerate(blocks):
+        if len(block) < 2:
+            continue
+        if limit is not None and translated_count >= limit:
+            continue
+        text_lines = block[2:] if len(block) > 2 else [""]
+        joined = "\n".join(text_lines)
+        item = {
+            "id": ("srt_block", block_idx),
+            "kind": "srt_block",
+            "block_idx": block_idx,
+            "block": block,
+            "original_text_field": joined,
+            "raw": joined,
+            "protected_text": joined,
+            "expected_line_count": len(text_lines),
+            "in_tokens": estimate_tokens_from_text(joined),
+        }
+        items.append(item)
+        translated_count += 1
+    return blocks, items
+
+
+def enforce_line_count(text: str, expected_count: int) -> str:
+    if expected_count <= 1:
+        return text.replace("\n", " ").strip()
+    lines = text.split("\n")
+    if len(lines) == expected_count:
+        return text
+    merged = " ".join(part.strip() for part in lines if part.strip()).strip()
+    if not merged:
+        return "\n".join([""] * expected_count)
+    words = merged.split()
+    if len(words) < expected_count:
+        words += [""] * (expected_count - len(words))
+    chunk = int(math.ceil(len(words) / float(expected_count)))
+    out_lines = []
+    cursor = 0
+    for _ in range(expected_count):
+        out_lines.append(" ".join(words[cursor : cursor + chunk]).strip())
+        cursor += chunk
+    return "\n".join(out_lines)
+
+
+def scan_srt_candidate(item: dict, candidate: str, target_lang: str) -> dict:
+    cleaned = strip_label_prefix(candidate or "")
+    source_text = item["original_text_field"]
+    reasons = []
+    if not cleaned.strip():
+        reasons.append("empty_output")
+    if has_label_prefix_artifact(cleaned):
+        reasons.append("label_prefix")
+    expected_line_count = item.get("expected_line_count", 1)
+    if cleaned.count("\n") + 1 != expected_line_count:
+        reasons.append("line_break_mismatch")
+    if has_target_language_leak(source_text, cleaned, target_lang):
+        reasons.append("language_leak")
+    if is_very_suspicious_translation(source_text, cleaned):
+        reasons.append("very_suspicious")
+
+    needs_repair = any(
+        reason in {"empty_output", "label_prefix", "line_break_mismatch", "language_leak", "very_suspicious"}
+        for reason in reasons
+    )
+    return {
+        "ok": not reasons,
+        "candidate": cleaned,
+        "reasons": reasons,
+        "needs_llm_repair": needs_repair,
+        "score": repair_issue_score(reasons),
+    }
+
+
+def extract_ass_slots(tokens: List[str]) -> Tuple[List[int], List[str]]:
+    slot_positions = []
+    slots = []
+    for idx, token in enumerate(tokens):
+        if token.startswith("{") or token in ("\\N", "\\n", "\\h"):
+            continue
+        slot_positions.append(idx)
+        slots.append(token)
+    return slot_positions, slots
+
+
+def reinsert_ass_slots(tokens: List[str], slot_positions: List[int], translated_slots: List[str]) -> str:
+    rebuilt = list(tokens)
+    for pos, translated in zip(slot_positions, translated_slots):
+        rebuilt[pos] = translated
+    return "".join(rebuilt)
+
+
+def translate_ass_slots_single(
+    client: OllamaClient,
+    item: dict,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+) -> str | None:
+    slot_positions, slots = extract_ass_slots(item["tokens"])
+    if not slots:
+        return item["original_text_field"]
+    summary_short, tone_short = trim_translation_context(summary, tone_guide)
+    full_plain = ass_plain_text(item["original_text_field"]).replace("\n", " ").strip()
+    user_msg = (
+        f"Translate slot texts to {target_lang}.\n"
+        "Rules:\n"
+        "1) Return ONLY a JSON array of strings with the same length/order as `slots`.\n"
+        "2) Do NOT add labels like ASS:, SRT:, Dialogue:.\n"
+        "3) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
+        "4) Do NOT add braces/tags/control codes.\n"
+    )
+    if summary_short:
+        user_msg += f"Summary hint: {summary_short}\n"
+    if tone_short:
+        user_msg += f"Tone hint: {tone_short}\n"
+    user_msg += f"Full line plain text: {full_plain}\nInput slots JSON: {json.dumps(slots, ensure_ascii=False)}"
+    try:
+        schema = build_fixed_array_schema(len(slots))
+        options_batch = build_options_for_batch(options, slots)
+        content = client.chat(
+            [
+                {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                {"role": "user", "content": user_msg},
+            ],
+            options=options_batch,
+            format=schema,
+        )
+    except OllamaTimeoutError:
+        return None
+    except RuntimeError as exc:
+        if "timed out" in str(exc).lower():
+            return None
+        return None
+    out = parse_array_response(content, len(slots))
+    if out is None:
+        return None
+    rebuilt = reinsert_ass_slots(item["tokens"], slot_positions, [strip_label_prefix(s) for s in out])
+    if not ass_structure_preserved(item["original_text_field"], rebuilt):
+        return None
+    return rebuilt
+
+
+def translate_ass_slots_batch_with_split(
+    client: OllamaClient,
+    items: List[dict],
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+) -> List[str | None]:
+    if not items:
+        return []
+    payload = []
+    payload_meta = []
+    for item in items:
+        slot_positions, slots = extract_ass_slots(item["tokens"])
+        payload_meta.append((slot_positions, slots))
+        payload.append(
+            {
+                "full": ass_plain_text(item["original_text_field"]).replace("\n", " ").strip(),
+                "slots": slots,
+            }
+        )
+    summary_short, tone_short = trim_translation_context(summary, tone_guide)
+    user_msg = (
+        f"Translate each `slots` array to {target_lang} using `full` only as context.\n"
+        "Rules:\n"
+        "1) Output ONLY a JSON array of arrays of strings.\n"
+        "2) Outer array length must equal input length; each inner array must match its `slots` length.\n"
+        "3) Do NOT add labels like ASS:, SRT:, Dialogue:.\n"
+        "4) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
+        "5) Do NOT add braces/tags/control codes.\n"
+    )
+    if summary_short:
+        user_msg += f"Summary hint: {summary_short}\n"
+    if tone_short:
+        user_msg += f"Tone hint: {tone_short}\n"
+    user_msg += f"Input JSON: {json.dumps(payload, ensure_ascii=False)}"
+
+    try:
+        schema = build_fixed_array_of_arrays_schema(len(items))
+        options_batch = build_options_for_batch(
+            options,
+            [json.dumps(entry, ensure_ascii=False) for entry in payload],
+        )
+        content = client.chat(
+            [
+                {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                {"role": "user", "content": user_msg},
+            ],
+            options=options_batch,
+            format=schema,
+        )
+    except OllamaTimeoutError:
+        content = None
+    except RuntimeError as exc:
+        if "timed out" in str(exc).lower():
+            content = None
         else:
-            restored = translate_ass_text_field_segmented(
+            content = None
+
+    if content is not None:
+        parsed = parse_array_of_arrays_response(content, len(items))
+    else:
+        parsed = None
+
+    if parsed is not None and len(parsed) == len(items):
+        out_lines: List[str | None] = []
+        for item, row, (slot_positions, slots) in zip(items, parsed, payload_meta):
+            if len(row) != len(slots):
+                out_lines.append(None)
+                continue
+            rebuilt = reinsert_ass_slots(
+                item["tokens"],
+                slot_positions,
+                [strip_label_prefix(text) for text in row],
+            )
+            if not ass_structure_preserved(item["original_text_field"], rebuilt):
+                out_lines.append(None)
+                continue
+            out_lines.append(rebuilt)
+        return out_lines
+
+    if len(items) == 1:
+        return [translate_ass_slots_single(client, items[0], summary, tone_guide, target_lang, options)]
+    mid = max(1, len(items) // 2)
+    return (
+        translate_ass_slots_batch_with_split(client, items[:mid], summary, tone_guide, target_lang, options)
+        + translate_ass_slots_batch_with_split(client, items[mid:], summary, tone_guide, target_lang, options)
+    )
+
+
+def run_ass_surgical_fallback(
+    client: OllamaClient,
+    failed_items: List[dict],
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+    console,
+) -> None:
+    if not failed_items:
+        return
+    total = len(failed_items)
+    if total <= 6:
+        for item in failed_items:
+            repaired = translate_ass_slots_single(client, item, summary, tone_guide, target_lang, options)
+            if repaired is not None:
+                item["forced_restored"] = repaired
+        return
+    if total > 20:
+        cprint(console, "Repair set is large; skipping surgical fallback for this batch.", "yellow")
+        return
+    for chunk in batched(failed_items, 8):
+        repaired_lines = translate_ass_slots_batch_with_split(
+            client,
+            chunk,
+            summary,
+            tone_guide,
+            target_lang,
+            options,
+        )
+        for item, repaired in zip(chunk, repaired_lines):
+            if repaired is not None:
+                item["forced_restored"] = repaired
+
+
+def fallback_srt_linewise(
+    client: OllamaClient,
+    item: dict,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+) -> str | None:
+    source_lines = item["original_text_field"].split("\n")
+    out_lines = translate_json_batch_with_split(
+        client,
+        source_lines,
+        summary,
+        tone_guide,
+        target_lang,
+        options,
+        mode="srt_block",
+        rolling_context="",
+    )
+    if len(out_lines) != len(source_lines):
+        return None
+    cleaned_lines = []
+    for source, translated in zip(source_lines, out_lines):
+        if translated is None:
+            return None
+        cleaned = strip_label_prefix(translated)
+        if has_target_language_leak(source, cleaned, target_lang):
+            return None
+        cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines)
+
+
+def retry_single_item_translation(
+    client: OllamaClient,
+    source_text: str,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    options,
+    mode: str,
+) -> str | None:
+    out = translate_json_batch_with_split(
+        client,
+        [source_text],
+        summary,
+        tone_guide,
+        target_lang,
+        options,
+        mode=mode,
+        rolling_context="",
+        force_temperature_zero=True,
+    )
+    if not out or out[0] is None:
+        return None
+    return strip_label_prefix(out[0])
+
+
+def translate_srt(
+    client: OllamaClient,
+    text: str,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    batch_size: int,
+    options,
+    limit: int | None,
+    console,
+    one_shot: bool = False,
+    rolling_context: int = 0,
+) -> Tuple[str, int]:
+    blocks, items = parse_srt_ir(text, limit)
+    if not items:
+        return text, 0
+
+    batches = build_adaptive_batches(items, batch_size, options, one_shot, console)
+    history: List[str] = []
+    with progress_bar(console) as progress:
+        task_id = progress.add_task("Translation", total=len(items))
+        for batch in batches:
+            sources = [item["protected_text"] for item in batch]
+            context_hint = rolling_context_snippet(history, rolling_context)
+            out = translate_json_batch_with_split(
                 client,
-                state["text_field"],
+                sources,
                 summary,
                 tone_guide,
                 target_lang,
                 options,
+                mode="srt_block",
+                rolling_context=context_hint,
             )
-        fields = state["fields"]
-        fields[state["text_idx"]] = restored
-        lines[line_idx] = f"{state['kind']}:{state['spaces']}{','.join(fields)}"
+            for item, candidate in zip(batch, out):
+                status = scan_srt_candidate(item, candidate or "", target_lang)
+                item["candidate"] = status["candidate"]
+                item["status"] = status
 
-    return "\n".join(lines), translated_count
+            failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
+            if failed_items and len(failed_items) > repair_limit:
+                cprint(console, "Too many SRT lines flagged; skipping fallback for this batch.", "yellow")
+            elif failed_items:
+                for item in failed_items:
+                    repaired = fallback_srt_linewise(
+                        client,
+                        item,
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                    )
+                    if repaired is not None:
+                        item["forced_text"] = repaired
+
+            for item in batch:
+                if "forced_text" in item:
+                    final_text = item["forced_text"]
+                elif item["status"]["ok"]:
+                    final_text = enforce_line_count(
+                        item["status"]["candidate"],
+                        item["expected_line_count"],
+                    )
+                else:
+                    retried = retry_single_item_translation(
+                        client,
+                        item["original_text_field"],
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        mode="srt_block",
+                    )
+                    if retried is not None:
+                        retry_status = scan_srt_candidate(item, retried, target_lang)
+                        if retry_status["ok"]:
+                            final_text = enforce_line_count(
+                                retry_status["candidate"],
+                                item["expected_line_count"],
+                            )
+                        else:
+                            final_text = item["original_text_field"]
+                    else:
+                        final_text = item["original_text_field"]
+                item["final_text"] = final_text
+                history.append(final_text.replace("\n", " ").strip())
+            progress.advance(task_id, len(batch))
+
+    for item in items:
+        block = blocks[item["block_idx"]]
+        new_lines = item["final_text"].split("\n")
+        blocks[item["block_idx"]] = [block[0], block[1], *new_lines]
+
+    out_lines = []
+    for i, block in enumerate(blocks):
+        out_lines.extend(block)
+        if i != len(blocks) - 1:
+            out_lines.append("")
+    return "\n".join(out_lines), len(items)
+
+
+def translate_ass(
+    client: OllamaClient,
+    text: str,
+    summary: str,
+    tone_guide: str,
+    target_lang: str,
+    batch_size: int,
+    options,
+    limit: int | None,
+    console,
+    ass_mode: str = "line",
+    one_shot: bool = False,
+    rolling_context: int = 0,
+) -> Tuple[str, int]:
+    if ass_mode == "segment":
+        return translate_ass_segment(
+            client,
+            text,
+            summary,
+            tone_guide,
+            target_lang,
+            batch_size,
+            options,
+            limit,
+            console,
+        )
+    lines, items = parse_ass_ir(text, limit)
+    if not items:
+        return text, 0
+
+    batches = build_adaptive_batches(items, batch_size, options, one_shot, console)
+    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup"}
+    history: List[str] = []
+
+    with progress_bar(console) as progress:
+        task_id = progress.add_task("Translation", total=len(items))
+        for batch in batches:
+            sources = [item["protected_text"] for item in batch]
+            context_hint = rolling_context_snippet(history, rolling_context)
+            out = translate_json_batch_with_split(
+                client,
+                sources,
+                summary,
+                tone_guide,
+                target_lang,
+                options,
+                mode="ass_protected",
+                rolling_context=context_hint,
+            )
+            for item, candidate in zip(batch, out):
+                candidate_text = candidate if candidate is not None else item["protected_text"]
+                item["text_field"] = item["original_text_field"]
+                item["protected"] = item["protected_text"]
+                status = scan_ass_line_candidate(item, candidate_text, target_lang)
+                item["candidate"] = status["candidate"]
+                item["status"] = status
+
+            failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
+            if failed_items and len(failed_items) > repair_limit:
+                cprint(console, "Too many ASS lines flagged; skipping fallback for this batch.", "yellow")
+            elif failed_items:
+                run_ass_surgical_fallback(
+                    client,
+                    failed_items,
+                    summary,
+                    tone_guide,
+                    target_lang,
+                    options,
+                    console,
+                )
+
+            for item in batch:
+                status = item["status"]
+                if "forced_restored" in item:
+                    forced = item["forced_restored"]
+                    if ass_structure_preserved(item["original_text_field"], forced):
+                        final_text = forced
+                    else:
+                        final_text = item["original_text_field"]
+                elif status["ok"] or not any(reason in severe_reasons for reason in status["reasons"]):
+                    final_text = status["restored"]
+                else:
+                    retried = retry_single_item_translation(
+                        client,
+                        item["protected_text"],
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        mode="ass_protected",
+                    )
+                    if retried is not None:
+                        retry_status = scan_ass_line_candidate(item, retried, target_lang)
+                        if retry_status["ok"]:
+                            final_text = retry_status["restored"]
+                        else:
+                            final_text = item["original_text_field"]
+                    else:
+                        final_text = item["original_text_field"]
+                item["final_text"] = final_text
+                history.append(ass_plain_text(final_text).replace("\n", " ").strip())
+            progress.advance(task_id, len(batch))
+
+    for item in items:
+        fields = item["fields"]
+        fields[item["text_idx"]] = item["final_text"]
+        lines[item["line_idx"]] = f"{item['dialogue_kind']}:{item['spaces']}{','.join(fields)}"
+
+    return "\n".join(lines), len(items)
 
 
 def translate_ass_segment(
@@ -976,26 +1987,112 @@ def translate_ass_segment(
 
     for (line_idx, token_idx, source_token), translated in zip(trans_tasks, translations):
         state = line_state.get(line_idx)
-        if state:
-            fixed = translated
-            needs_retry = (
-                is_suspicious_translation(source_token, translated)
-                or not ass_placeholders_match(source_token, translated)
-                or has_ass_markup(translated)
+        if not state:
+            continue
+        state.setdefault("task_candidates", {})
+        state["task_candidates"][token_idx] = strip_label_prefix(translated)
+
+    for line_idx, token_idx, source_token in trans_tasks:
+        state = line_state.get(line_idx)
+        if not state:
+            continue
+        state.setdefault("task_candidates", {})
+        if token_idx not in state["task_candidates"]:
+            state["task_candidates"][token_idx] = source_token
+        state.setdefault("task_status", {})
+        candidate = state["task_candidates"][token_idx]
+        state["task_status"][token_idx] = scan_ass_segment_candidate(source_token, candidate, target_lang)
+
+    failed_tasks: List[Tuple[int, int, str]] = []
+    for line_idx, token_idx, source_token in trans_tasks:
+        state = line_state.get(line_idx)
+        if not state:
+            continue
+        status = state.get("task_status", {}).get(token_idx, {})
+        if status.get("needs_llm_repair"):
+            failed_tasks.append((line_idx, token_idx, source_token))
+
+    repair_limit = max(8, int(math.ceil(0.15 * max(1, len(trans_tasks)))))
+    allow_llm_repair = len(failed_tasks) <= repair_limit
+    if failed_tasks and not allow_llm_repair:
+        cprint(console, "Too many lines flagged; skipping LLM repair to keep performance", "yellow")
+
+    if failed_tasks and allow_llm_repair:
+        repair_items = []
+        for line_idx, token_idx, source_token in failed_tasks:
+            state = line_state.get(line_idx)
+            candidate = ""
+            if state:
+                candidate = state.get("task_candidates", {}).get(token_idx, "")
+            repair_items.append(
+                {
+                    "src": source_token,
+                    "bad": candidate,
+                }
             )
-            if needs_retry:
-                retry = guarded_translate_one(
-                    client,
-                    source_token,
-                    summary,
-                    tone_guide,
-                    target_lang,
-                    options,
-                    source_for_checks=source_token,
-                    validator=lambda cand: not has_ass_markup(cand) and not has_placeholder_artifacts(cand),
-                )
-                fixed = retry if retry is not None else source_token
-            state["tokens"][token_idx] = fixed
+        repaired = repair_batch(client, repair_items, summary, tone_guide, target_lang, options)
+        for (line_idx, token_idx, _), candidate in zip(failed_tasks, repaired):
+            if candidate is None:
+                continue
+            state = line_state.get(line_idx)
+            if state:
+                state.setdefault("task_candidates", {})
+                state["task_candidates"][token_idx] = strip_label_prefix(candidate)
+                state.setdefault("task_status", {})
+                state["task_status"][token_idx] = scan_ass_segment_candidate(source_token, state["task_candidates"][token_idx], target_lang)
+
+    unresolved_tasks = []
+    for line_idx, token_idx, source_token in failed_tasks:
+        state = line_state.get(line_idx)
+        if not state:
+            continue
+        status = state.get("task_status", {}).get(token_idx, {})
+        if status.get("needs_llm_repair"):
+            unresolved_tasks.append((line_idx, token_idx, source_token))
+
+    unresolved_tasks = sorted(
+        unresolved_tasks,
+        key=lambda item: line_state[item[0]]["task_status"][item[1]]["score"],
+        reverse=True,
+    )[:MAX_REPAIR_FALLBACK_LINES]
+
+    for line_idx, token_idx, source_token in unresolved_tasks:
+        state = line_state.get(line_idx)
+        if not state:
+            continue
+        candidate = state["task_candidates"][token_idx]
+        status = state["task_status"][token_idx]
+        if status.get("needs_llm_repair"):
+            retry = guarded_translate_one(
+                client,
+                source_token,
+                summary,
+                tone_guide,
+                target_lang,
+                options,
+                source_for_checks=source_token,
+                validator=lambda cand, src=source_token: scan_ass_segment_candidate(src, cand, target_lang)["ok"],
+                prefer_no_context=True,
+            )
+            if retry is not None:
+                retry = strip_label_prefix(retry)
+                status = scan_ass_segment_candidate(source_token, retry, target_lang)
+                if status["ok"]:
+                    candidate = retry
+        state["task_candidates"][token_idx] = candidate
+        state["task_status"][token_idx] = status
+
+    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup"}
+    for line_idx, token_idx, source_token in trans_tasks:
+        state = line_state.get(line_idx)
+        if not state:
+            continue
+        candidate = state["task_candidates"][token_idx]
+        status = state["task_status"][token_idx]
+        if status["ok"] or not any(reason in severe_reasons for reason in status["reasons"]):
+            state["tokens"][token_idx] = candidate
+        else:
+            state["tokens"][token_idx] = source_token
 
     for line_idx, state in line_state.items():
         new_text = "".join(state["tokens"])
@@ -1273,12 +2370,11 @@ def apply_fast_profile(args, console) -> None:
         args.num_ctx = 4096
     if args.num_threads is None:
         args.num_threads = cpu_threads
-    if args.num_gpu is None:
-        args.num_gpu = 0
+    gpu_display = args.num_gpu if args.num_gpu is not None else "auto"
     cprint(
         console,
         f"Fast profile: batch={args.batch_size}, ctx={args.num_ctx}, predict={args.num_predict}, "
-        f"threads={args.num_threads}, gpu={args.num_gpu}",
+        f"threads={args.num_threads}, gpu={gpu_display}",
         "bold cyan",
     )
 
@@ -1291,9 +2387,10 @@ def main() -> int:
     parser.add_argument("--model", default="gemma3:4b", help="Ollama model name")
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host")
     parser.add_argument("--target", default="Spanish", help="Target language")
-    parser.add_argument("--batch-size", type=int, default=6, help="Batch size for translation")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size upper bound for translation")
     parser.add_argument("--summary-chars", type=int, default=6000, help="Max chars per summary chunk")
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout seconds")
+    parser.add_argument("--keep-alive", default="10m", help="Ollama keep_alive value (e.g. 10m, 0)")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
     parser.add_argument("--num-predict", type=int, help="Limit tokens generated per response")
     parser.add_argument("--num-ctx", type=int, help="Context window size")
@@ -1304,7 +2401,16 @@ def main() -> int:
     parser.add_argument("--interactive", action="store_true", help="Interactive mode")
     parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
     parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
+    parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
+    parser.add_argument("--rolling-context", type=int, default=2, help="Use last N translated lines as rolling context")
+    parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
     args = parser.parse_args()
+
+    if args.self_test:
+        self_test_ass_repair_snippet()
+        self_test_hybrid_pipeline()
+        cprint(console, "Self-test OK", "bold green")
+        return 0
 
     if args.interactive or not args.in_path:
         try:
@@ -1339,7 +2445,7 @@ def main() -> int:
         options["num_thread"] = args.num_threads
     if args.num_gpu is not None:
         options["num_gpu"] = args.num_gpu
-    client = OllamaClient(args.host, args.model, args.timeout)
+    client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
 
     # Build summary first
     summary = ""
@@ -1373,6 +2479,8 @@ def main() -> int:
             args.limit,
             console,
             args.ass_mode,
+            args.one_shot,
+            args.rolling_context,
         )
     elif ext == ".srt":
         out_text, translated_count = translate_srt(
@@ -1385,6 +2493,8 @@ def main() -> int:
             options,
             args.limit,
             console,
+            args.one_shot,
+            args.rolling_context,
         )
     else:
         print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
