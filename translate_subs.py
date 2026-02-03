@@ -44,6 +44,8 @@ LABEL_PREFIX_RE = re.compile(
     flags=re.IGNORECASE,
 )
 SPANISH_MARKER_RE = re.compile(r"[áéíóúñüÁÉÍÓÚÑÜ]")
+CREDITS_OVERRIDE_RE = re.compile(r"\bBrought to you by\s*\[[^\]]+\]", flags=re.IGNORECASE)
+HONORIFICS = {"mr", "mrs", "ms", "miss", "sir", "ma'am", "madam"}
 SUMMARY_MARKERS = (
     "summary",
     "resumen",
@@ -443,6 +445,34 @@ def has_target_language_leak(source: str, translated: str, target_lang: str) -> 
         if not src_tokens.intersection({"senor", "senora", "senorita", "espanol"}):
             return True
     return False
+
+
+def is_unchanged_english(source_plain: str, translated_plain: str, target_lang: str) -> bool:
+    if normalize_target_lang(target_lang) != "es":
+        return False
+    src = (source_plain or "").strip()
+    dst = (translated_plain or "").strip()
+    if not src or not dst:
+        return False
+    if src.lower() != dst.lower():
+        return False
+    tokens = ascii_word_tokens(src)
+    if not tokens:
+        return False
+    if any(token in EN_STOPWORDS for token in tokens):
+        return True
+    if any(token in HONORIFICS for token in tokens):
+        return True
+    if len(tokens) >= 3:
+        has_spanish_markers = bool(SPANISH_MARKER_RE.search(dst))
+        es_hits = sum(1 for token in ascii_word_tokens(dst) if token in ES_STOPWORDS)
+        if not has_spanish_markers and es_hits == 0:
+            return True
+    return False
+
+
+def apply_phrase_overrides(text: str) -> str:
+    return CREDITS_OVERRIDE_RE.sub("Tra\u00eddo por [el_inmortus]", text or "")
 
 
 def is_very_suspicious_translation(source: str, translated: str) -> bool:
@@ -1159,6 +1189,7 @@ def repair_issue_score(reasons: List[str]) -> int:
     weights = {
         "empty_output": 6,
         "placeholder_mismatch": 6,
+        "unchanged": 6,
         "placeholder_artifacts": 5,
         "unexpected_ass_markup": 4,
         "language_leak": 4,
@@ -1184,6 +1215,8 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
         reasons.append("unexpected_ass_markup")
     if placeholder_artifact_found or has_placeholder_artifacts(restored):
         reasons.append("placeholder_artifacts")
+    if is_unchanged_english(source_plain, restored_plain, target_lang):
+        reasons.append("unchanged")
     if has_target_language_leak(source_plain, restored_plain, target_lang):
         reasons.append("language_leak")
     if is_very_suspicious_translation(source_plain, restored_plain):
@@ -1191,7 +1224,7 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
 
     ok = len(reasons) == 0
     needs_llm_repair = any(
-        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "language_leak", "very_suspicious"}
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
         for reason in reasons
     )
     return {
@@ -1217,12 +1250,14 @@ def scan_ass_segment_candidate(source_token: str, candidate: str, target_lang: s
         reasons.append("placeholder_artifacts")
     if has_target_language_leak(source_token, cleaned, target_lang):
         reasons.append("language_leak")
+    if is_unchanged_english(source_token, cleaned, target_lang):
+        reasons.append("unchanged")
     if is_very_suspicious_translation(source_token, cleaned):
         reasons.append("very_suspicious")
 
     ok = len(reasons) == 0
     needs_llm_repair = any(
-        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "language_leak", "very_suspicious"}
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
         for reason in reasons
     )
     return {
@@ -1286,6 +1321,18 @@ def self_test_hybrid_pipeline() -> None:
     srt_source = {"original_text_field": "Hello\nthere", "expected_line_count": 2}
     srt_status = scan_srt_candidate(srt_source, "Hola\nalli", "Spanish")
     assert srt_status["ok"]
+    miss_src = "Miss Ito,"
+    miss_protected, miss_repl = ass_protect_tags(miss_src)
+    miss_state = {
+        "text_field": miss_src,
+        "protected": miss_protected,
+        "replacements": miss_repl,
+    }
+    miss_status = scan_ass_line_candidate(miss_state, "Miss Ito,", "Spanish")
+    assert "unchanged" in miss_status["reasons"]
+    assert miss_status["needs_llm_repair"]
+    credits = "{\\an8}Brought to you by [ToonsHub]"
+    assert apply_phrase_overrides(credits) == "{\\an8}Tra\u00eddo por [el_inmortus]"
 
 
 def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
@@ -1327,6 +1374,10 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
         text_field = fields[text_idx]
         if not should_translate(text_field):
             continue
+        fixed_final_text = None
+        overridden_text = apply_phrase_overrides(text_field)
+        if overridden_text != text_field:
+            fixed_final_text = overridden_text
         protected, replacements = ass_protect_tags(text_field)
         tokens = split_ass_text(text_field)
         item = {
@@ -1344,6 +1395,7 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
             "protected": protected,
             "replacements": replacements,
             "in_tokens": estimate_tokens_from_text(protected),
+            "fixed_final_text": fixed_final_text,
         }
         items.append(item)
         translated_count += 1
@@ -1373,6 +1425,10 @@ def parse_srt_ir(text: str, limit: int | None) -> Tuple[List[List[str]], List[di
             continue
         text_lines = block[2:] if len(block) > 2 else [""]
         joined = "\n".join(text_lines)
+        fixed_final_text = None
+        overridden_text = apply_phrase_overrides(joined)
+        if overridden_text != joined:
+            fixed_final_text = overridden_text
         item = {
             "id": ("srt_block", block_idx),
             "kind": "srt_block",
@@ -1383,6 +1439,7 @@ def parse_srt_ir(text: str, limit: int | None) -> Tuple[List[List[str]], List[di
             "protected_text": joined,
             "expected_line_count": len(text_lines),
             "in_tokens": estimate_tokens_from_text(joined),
+            "fixed_final_text": fixed_final_text,
         }
         items.append(item)
         translated_count += 1
@@ -1421,13 +1478,15 @@ def scan_srt_candidate(item: dict, candidate: str, target_lang: str) -> dict:
     expected_line_count = item.get("expected_line_count", 1)
     if cleaned.count("\n") + 1 != expected_line_count:
         reasons.append("line_break_mismatch")
+    if is_unchanged_english(source_text, cleaned, target_lang):
+        reasons.append("unchanged")
     if has_target_language_leak(source_text, cleaned, target_lang):
         reasons.append("language_leak")
     if is_very_suspicious_translation(source_text, cleaned):
         reasons.append("very_suspicious")
 
     needs_repair = any(
-        reason in {"empty_output", "label_prefix", "line_break_mismatch", "language_leak", "very_suspicious"}
+        reason in {"empty_output", "label_prefix", "line_break_mismatch", "unchanged", "language_leak", "very_suspicious"}
         for reason in reasons
     )
     return {
@@ -1708,10 +1767,15 @@ def translate_srt(
     if not items:
         return text, 0
 
-    batches = build_adaptive_batches(items, batch_size, options, one_shot, console)
+    translatable_items = [item for item in items if not item.get("fixed_final_text")]
+    for item in items:
+        if item.get("fixed_final_text"):
+            item["final_text"] = item["fixed_final_text"]
+
+    batches = build_adaptive_batches(translatable_items, batch_size, options, one_shot, console)
     history: List[str] = []
     with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(items))
+        task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
             sources = [item["protected_text"] for item in batch]
             context_hint = rolling_context_snippet(history, rolling_context)
@@ -1782,7 +1846,8 @@ def translate_srt(
 
     for item in items:
         block = blocks[item["block_idx"]]
-        new_lines = item["final_text"].split("\n")
+        final_text = apply_phrase_overrides(item["final_text"])
+        new_lines = final_text.split("\n")
         blocks[item["block_idx"]] = [block[0], block[1], *new_lines]
 
     out_lines = []
@@ -1823,12 +1888,17 @@ def translate_ass(
     if not items:
         return text, 0
 
-    batches = build_adaptive_batches(items, batch_size, options, one_shot, console)
-    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup"}
+    translatable_items = [item for item in items if not item.get("fixed_final_text")]
+    for item in items:
+        if item.get("fixed_final_text"):
+            item["final_text"] = item["fixed_final_text"]
+
+    batches = build_adaptive_batches(translatable_items, batch_size, options, one_shot, console)
+    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
     history: List[str] = []
 
     with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(items))
+        task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
             sources = [item["protected_text"] for item in batch]
             context_hint = rolling_context_snippet(history, rolling_context)
@@ -1899,7 +1969,7 @@ def translate_ass(
 
     for item in items:
         fields = item["fields"]
-        fields[item["text_idx"]] = item["final_text"]
+        fields[item["text_idx"]] = apply_phrase_overrides(item["final_text"])
         lines[item["line_idx"]] = f"{item['dialogue_kind']}:{item['spaces']}{','.join(fields)}"
 
     return "\n".join(lines), len(items)
@@ -2082,7 +2152,7 @@ def translate_ass_segment(
         state["task_candidates"][token_idx] = candidate
         state["task_status"][token_idx] = status
 
-    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup"}
+    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
     for line_idx, token_idx, source_token in trans_tasks:
         state = line_state.get(line_idx)
         if not state:
@@ -2095,7 +2165,7 @@ def translate_ass_segment(
             state["tokens"][token_idx] = source_token
 
     for line_idx, state in line_state.items():
-        new_text = "".join(state["tokens"])
+        new_text = apply_phrase_overrides("".join(state["tokens"]))
         fields = state["fields"]
         fields[state["text_idx"]] = new_text
         lines[line_idx] = f"{state['kind']}:{state['spaces']}{','.join(fields)}"
