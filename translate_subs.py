@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from contextlib import contextmanager
+import fnmatch
 import json
 import math
 import os
@@ -2786,16 +2787,58 @@ def prompt_choice(
         cprint(console, "Invalid choice. Try again.", "yellow")
 
 
-def build_output_path(in_path: Path, target_lang: str) -> Path:
+def target_suffix_for_lang(target_lang: str) -> str:
     lang = target_lang.strip().lower()
+    if lang in ("spanish", "es", "es-419", "es_419"):
+        return "es-419"
+    if lang in ("english", "en", "en-us", "en_us", "en-gb", "en_gb"):
+        return "en"
+    return "translated"
+
+
+def is_already_target_file(path: Path, target_lang: str) -> bool:
+    stem = path.stem.lower()
+    suffix = target_suffix_for_lang(target_lang).lower()
+    if suffix == "translated":
+        return stem.endswith(".translated")
+    return stem.endswith(f"_{suffix}")
+
+
+def build_output_path(in_path: Path, target_lang: str) -> Path:
     suffix = in_path.suffix
     stem = in_path.stem
     out_dir = bulk_dir()
-    if lang in ("spanish", "es", "es-419", "es_419"):
-        return out_dir / f"{stem}_es-419{suffix}"
-    if lang in ("english", "en", "en-us", "en_us", "en-gb", "en_gb"):
-        return out_dir / f"{stem}_en{suffix}"
-    return out_dir / f"{stem}.translated{suffix}"
+    target_suffix = target_suffix_for_lang(target_lang)
+
+    normalized = stem.lower()
+    if target_suffix == "translated":
+        if normalized.endswith(".translated"):
+            stem = stem[: -len(".translated")]
+        return out_dir / f"{stem}.translated{suffix}"
+
+    if normalized.endswith(f"_{target_suffix.lower()}"):
+        stem = stem[: -(len(target_suffix) + 1)]
+    return out_dir / f"{stem}_{target_suffix}{suffix}"
+
+
+def collect_batch_inputs(raw_input: str | None, target_lang: str) -> List[Path]:
+    files = list_subtitle_files([".srt", ".ass"])
+    if raw_input:
+        resolved = resolve_input_path(raw_input)
+        if resolved.exists():
+            files = [resolved]
+        else:
+            files = [f for f in files if fnmatch.fnmatch(f.name, raw_input)]
+
+    out = []
+    seen = set()
+    for file_path in files:
+        if is_already_target_file(file_path, target_lang):
+            continue
+        if file_path not in seen:
+            seen.add(file_path)
+            out.append(file_path)
+    return sorted(out)
 
 
 def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, str]:
@@ -2898,95 +2941,7 @@ def apply_fast_profile(args, console) -> None:
     )
 
 
-def main() -> int:
-    console = get_console()
-    RUNTIME_METRICS.reset()
-    parser = argparse.ArgumentParser(description="Translate .ASS/.SRT subtitles using local Ollama.")
-    parser.add_argument("--in", dest="in_path", help="Input subtitle file")
-    parser.add_argument("--out", dest="out_path", help="Output subtitle file")
-    parser.add_argument("--model", default="gemma3:4b", help="Ollama model name")
-    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host")
-    parser.add_argument("--target", default="Spanish", help="Target language")
-    parser.add_argument("--batch-size", type=int, default=256, help="Batch size upper bound for translation")
-    parser.add_argument("--summary-chars", type=int, default=6000, help="Max chars per summary chunk")
-    parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout seconds")
-    parser.add_argument("--keep-alive", default="10m", help="Ollama keep_alive value (e.g. 10m, 0)")
-    parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
-    parser.add_argument("--num-predict", type=int, help="Limit tokens generated per response")
-    parser.add_argument("--num-ctx", type=int, help="Context window size")
-    parser.add_argument("--num-threads", type=int, help="Threads for model execution")
-    parser.add_argument("--num-gpu", type=int, help="GPU layers for model execution")
-    parser.add_argument("--limit", type=int, help="Translate only the first N dialogue blocks")
-    parser.add_argument("--skip-summary", action="store_true", help="Skip the summary step")
-    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
-    parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
-    parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
-    parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
-    parser.add_argument("--rolling-context", type=int, default=2, help="Use last N translated lines as rolling context")
-    parser.add_argument(
-        "--format-mode",
-        choices=["auto", "json", "schema"],
-        default="auto",
-        help="Structured output mode: auto=json fast path + schema retry, json=always json, schema=always schema",
-    )
-    parser.add_argument(
-        "--minify-json",
-        dest="minify_json",
-        action="store_true",
-        default=True,
-        help="Minify JSON payload embedded in prompts (default: on)",
-    )
-    parser.add_argument(
-        "--no-minify-json",
-        dest="minify_json",
-        action="store_false",
-        help="Disable minified JSON payloads in prompts",
-    )
-    parser.add_argument("--bench", action="store_true", help="Enable detailed per-call bench logging")
-    parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
-    args = parser.parse_args()
-    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
-
-    if args.self_test:
-        self_test_ass_repair_snippet()
-        self_test_hybrid_pipeline()
-        cprint(console, "Self-test OK", "bold green")
-        return 0
-
-    if args.interactive or not args.in_path:
-        try:
-            in_path, out_path, args.target, args.limit, skip_summary, model = interactive_flow(
-                args, console
-            )
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        if skip_summary:
-            args.skip_summary = True
-        if model:
-            args.model = model
-    else:
-        in_path = resolve_input_path(args.in_path)
-        if not in_path.exists():
-            print(f"Input not found: {in_path}", file=sys.stderr)
-            return 2
-        out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
-
-    apply_fast_profile(args, console)
-    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
-    if args.bench:
-        cprint(
-            console,
-            (
-                f"Bench mode ON | format_mode={resolve_format_mode()} | "
-                f"minify_json={'on' if MINIFY_JSON_PROMPTS else 'off'}"
-            ),
-            "bold cyan",
-        )
-
-    text, line_ending, final_newline, bom = read_text(in_path)
-    ext = in_path.suffix.lower()
-
+def build_ollama_options(args) -> dict:
     options = {"temperature": args.temperature}
     if args.num_predict is not None:
         options["num_predict"] = args.num_predict
@@ -2996,10 +2951,16 @@ def main() -> int:
         options["num_thread"] = args.num_threads
     if args.num_gpu is not None:
         options["num_gpu"] = args.num_gpu
-    client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
+    return options
+
+
+def translate_single_file(client, console, args, in_path: Path, out_path: Path) -> int:
+    RUNTIME_METRICS.reset()
+    text, line_ending, final_newline, bom = read_text(in_path)
+    ext = in_path.suffix.lower()
+    options = build_ollama_options(args)
     start_total = time.perf_counter()
 
-    # Build summary first
     summary = ""
     tone_guide = ""
     if not args.skip_summary:
@@ -3064,6 +3025,139 @@ def main() -> int:
     cprint(console, f"Elapsed (total): {total_elapsed:.1f}s", "bold green")
     print_runtime_breakdown(console, total_elapsed)
     return 0
+
+
+def main() -> int:
+    console = get_console()
+    RUNTIME_METRICS.reset()
+    parser = argparse.ArgumentParser(description="Translate .ASS/.SRT subtitles using local Ollama.")
+    parser.add_argument("--in", dest="in_path", help="Input subtitle file (or glob in --batch)")
+    parser.add_argument("--out", dest="out_path", help="Output subtitle file")
+    parser.add_argument("--model", default="gemma3:4b", help="Ollama model name")
+    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host")
+    parser.add_argument("--target", default="Spanish", help="Target language")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size upper bound for translation")
+    parser.add_argument("--summary-chars", type=int, default=6000, help="Max chars per summary chunk")
+    parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout seconds")
+    parser.add_argument("--keep-alive", default="10m", help="Ollama keep_alive value (e.g. 10m, 0)")
+    parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
+    parser.add_argument("--num-predict", type=int, help="Limit tokens generated per response")
+    parser.add_argument("--num-ctx", type=int, help="Context window size")
+    parser.add_argument("--num-threads", type=int, help="Threads for model execution")
+    parser.add_argument("--num-gpu", type=int, help="GPU layers for model execution")
+    parser.add_argument("--limit", type=int, help="Translate only the first N dialogue blocks")
+    parser.add_argument("--skip-summary", action="store_true", help="Skip the summary step")
+    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
+    parser.add_argument("--batch", action="store_true", help="Translate all subtitle files in SUBS_BULK")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite outputs in --batch mode")
+    parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
+    parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
+    parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
+    parser.add_argument("--rolling-context", type=int, default=2, help="Use last N translated lines as rolling context")
+    parser.add_argument(
+        "--format-mode",
+        choices=["auto", "json", "schema"],
+        default="auto",
+        help="Structured output mode: auto=json fast path + schema retry, json=always json, schema=always schema",
+    )
+    parser.add_argument(
+        "--minify-json",
+        dest="minify_json",
+        action="store_true",
+        default=True,
+        help="Minify JSON payload embedded in prompts (default: on)",
+    )
+    parser.add_argument(
+        "--no-minify-json",
+        dest="minify_json",
+        action="store_false",
+        help="Disable minified JSON payloads in prompts",
+    )
+    parser.add_argument("--bench", action="store_true", help="Enable detailed per-call bench logging")
+    parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
+    args = parser.parse_args()
+    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
+
+    if args.self_test:
+        self_test_ass_repair_snippet()
+        self_test_hybrid_pipeline()
+        cprint(console, "Self-test OK", "bold green")
+        return 0
+
+    if args.batch and args.interactive:
+        print("Cannot combine --batch with --interactive", file=sys.stderr)
+        return 2
+    if args.batch and args.out_path:
+        print("--out is not supported in --batch mode", file=sys.stderr)
+        return 2
+
+    in_path = None
+    out_path = None
+    if not args.batch:
+        if args.interactive or not args.in_path:
+            try:
+                in_path, out_path, args.target, args.limit, skip_summary, model = interactive_flow(
+                    args, console
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            if skip_summary:
+                args.skip_summary = True
+            if model:
+                args.model = model
+        else:
+            in_path = resolve_input_path(args.in_path)
+            if not in_path.exists():
+                print(f"Input not found: {in_path}", file=sys.stderr)
+                return 2
+            out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
+
+    apply_fast_profile(args, console)
+    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
+    if args.bench:
+        cprint(
+            console,
+            (
+                f"Bench mode ON | format_mode={resolve_format_mode()} | "
+                f"minify_json={'on' if MINIFY_JSON_PROMPTS else 'off'}"
+            ),
+            "bold cyan",
+        )
+
+    client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
+
+    if args.batch:
+        files = collect_batch_inputs(args.in_path, args.target)
+        if not files:
+            cprint(console, "No subtitle files found for batch translation.", "yellow")
+            return 0
+
+        ok = 0
+        skipped = 0
+        failed = 0
+        for file_path in files:
+            out_file = build_output_path(file_path, args.target)
+            if out_file.exists() and not args.overwrite:
+                skipped += 1
+                cprint(console, f"Skip (exists): {out_file.name}", "yellow")
+                continue
+
+            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+            code = translate_single_file(client, console, args, file_path, out_file)
+            if code == 0:
+                ok += 1
+            else:
+                failed += 1
+
+        cprint(
+            console,
+            f"\nBatch summary -> ok: {ok}, skipped: {skipped}, failed: {failed}",
+            "bold cyan" if failed == 0 else "bold yellow",
+        )
+        return 0 if failed == 0 else 1
+
+    return translate_single_file(client, console, args, in_path, out_path)
 
 
 if __name__ == "__main__":

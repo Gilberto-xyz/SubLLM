@@ -9,7 +9,8 @@ Herramientas para trabajar subtitulos locales:
 ## Scripts incluidos
 
 - `translate_subs.py`: traduce subtitulos con contexto (resumen + guia de tono).
-- `EXTRAER_subs_v1.py`: extrae pistas de subtitulos de videos con `ffprobe`/`ffmpeg`.
+- `GESTIONAR_subs_v1.py`: extrae y muxea subtitulos en `SUBS_BULK/`.
+- `EXTRAER_subs_v1.py`: wrapper de compatibilidad que delega a `GESTIONAR_subs_v1.py`.
 
 ## Requisitos
 
@@ -17,6 +18,7 @@ Herramientas para trabajar subtitulos locales:
 - Ollama instalado y activo (para traduccion).
 - Un modelo instalado en Ollama (ejemplo: `gemma3:4b`).
 - `ffmpeg` y `ffprobe` en PATH (para extraccion).
+- Recomendado: MKVToolNix (`mkvmerge`) para mux de MKV mas robusto.
 - Opcional: `rich` para barras de progreso mas claras.
 
 ## Instalacion rapida
@@ -54,6 +56,8 @@ Nota:
 Opciones utiles:
 
 - `--out`: ruta de salida.
+- `--batch`: traduce en lote todos los `.ass/.srt` de `SUBS_BULK/`.
+- `--overwrite`: con `--batch`, sobrescribe salidas existentes.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad.
@@ -65,24 +69,28 @@ Salida por defecto:
 - Si el destino es espanol: `*_es-419.srt` o `*_es-419.ass`.
 - Si el destino es ingles: `*_en.srt` o `*_en.ass`.
 
-## Uso: extraccion de subtitulos desde video
+## Uso: extraccion y mux de subtitulos
 
-En la carpeta con videos:
+Con videos y subtitulos dentro de `SUBS_BULK/`:
 
 ```bash
-python EXTRAER_subs_v1.py
+python GESTIONAR_subs_v1.py
 ```
 
 El script:
 
 - Detecta pistas de subtitulo disponibles por idioma.
-- Te pide seleccionar idiomas.
-- Extrae resultados a `SUBS_BULK/`.
+- Permite extraer, muxear o hacer ambas cosas.
 - Conserva formato (`ass`/`srt`) o convierte a `srt` cuando aplica.
+- Al muxear, agrega metadatos de idioma/titulo a subtitulos externos.
+- Si hay subtitulo en espanol, lo marca como `default`.
+- Si `mkvmerge` esta disponible, lo usa automaticamente para mux de `.mkv`.
+- Puede reemplazar el video original (con backup opcional).
+- Al final pregunta si deseas borrar subtitulos ya muxeados.
 
 ## Flujo recomendado
 
-1. Ejecuta `EXTRAER_subs_v1.py` para sacar subtitulos del video.
+1. Ejecuta `GESTIONAR_subs_v1.py` para sacar subtitulos del video.
 2. Revisa el archivo extraido (`.ass` o `.srt`).
 3. Traduce con `translate_subs.py`.
 4. Prueba el resultado en tu reproductor y ajusta parametros si hace falta.
