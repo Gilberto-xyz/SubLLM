@@ -71,7 +71,8 @@ BULK_DIR_NAME = "SUBS_BULK"
 SINGLE_TRANSLATION_CACHE = {}
 REPAIR_BATCH_MAX = 8
 MAX_REPAIR_FALLBACK_LINES = 3
-ASS_MAX_BATCH_ITEMS = 12
+ASS_MAX_BATCH_ITEMS = 32
+ONE_SHOT_MAX_BATCH_ITEMS = 64
 DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
@@ -1049,6 +1050,13 @@ def batched(items: List[T], size: int) -> List[List[T]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def effective_batch_cap(batch_size: int, one_shot: bool) -> int:
+    requested = max(1, int(batch_size))
+    if one_shot:
+        return min(requested, ONE_SHOT_MAX_BATCH_ITEMS)
+    return min(requested, ASS_MAX_BATCH_ITEMS)
+
+
 def should_translate(segment: str) -> bool:
     return bool(re.search(r"[A-Za-z]", segment))
 
@@ -1353,6 +1361,11 @@ def translate_json_batch(
     else:
         request_format = "json"
         used_auto_json = selected_format_mode == "auto"
+    already_schema = isinstance(request_format, dict)
+    try:
+        already_temp0 = float(options_batch.get("temperature", 0.0)) == 0.0
+    except (TypeError, ValueError):
+        already_temp0 = False
     with RUNTIME_METRICS.timed(timing_label):
         content = client.chat(messages, options=options_batch, format=request_format)
     parsed = parse_array_response(content, len(texts))
@@ -1372,6 +1385,8 @@ def translate_json_batch(
                     f"fails={AUTO_JSON_FAILS}, fail_rate={fail_rate:.2f})"
                 )
     if selected_format_mode != "auto":
+        return None
+    if already_schema and already_temp0:
         return None
     # Fast path in auto mode: retry once with strict schema + temp=0 only on parse/length failure.
     RUNTIME_METRICS.bump("format.schema_retry.attempts")
@@ -1470,8 +1485,48 @@ def repair_issue_score(reasons: List[str]) -> int:
     return sum(weights.get(reason, 1) for reason in reasons)
 
 
-def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> dict:
+def split_plain_text_for_slots(text: str, expected_slots: int) -> List[str]:
+    if expected_slots <= 0:
+        return []
+    raw_lines = [segment.strip() for segment in text.split("\n")]
+    if len(raw_lines) == expected_slots:
+        return raw_lines
+    merged = " ".join(segment for segment in raw_lines if segment).strip()
+    if not merged:
+        return [""] * expected_slots
+    words = merged.split()
+    if len(words) < expected_slots:
+        words += [""] * (expected_slots - len(words))
+    chunk = int(math.ceil(len(words) / float(expected_slots)))
+    out = []
+    cursor = 0
+    for _ in range(expected_slots):
+        out.append(" ".join(words[cursor : cursor + chunk]).strip())
+        cursor += chunk
+    return out
+
+
+def recover_ass_candidate_placeholders(state: dict, candidate: str) -> str | None:
     cleaned = strip_label_prefix(candidate or "")
+    if not cleaned.strip():
+        return None
+    plain = ass_plain_text(cleaned).strip()
+    if not plain:
+        return None
+    tokens = list(state.get("tokens") or split_ass_text(state["text_field"]))
+    slot_positions, _ = extract_ass_slots(tokens)
+    if not slot_positions:
+        return None
+    translated_slots = split_plain_text_for_slots(plain, len(slot_positions))
+    rebuilt = reinsert_ass_slots(tokens, slot_positions, translated_slots)
+    rebuilt_protected, _ = ass_protect_tags(rebuilt)
+    source_protected = state.get("protected") or state.get("protected_text")
+    if source_protected and not ass_placeholders_match(source_protected, rebuilt_protected):
+        return None
+    return rebuilt_protected
+
+
+def evaluate_ass_line_candidate(state: dict, cleaned: str, target_lang: str) -> dict:
     source_plain = ass_plain_text(state["text_field"])
     placeholder_ok = ass_placeholders_match(state["protected"], cleaned)
     markup_found = has_ass_markup(cleaned)
@@ -1493,6 +1548,24 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
         reasons.append("language_leak")
     if is_very_suspicious_translation(source_plain, restored_plain):
         reasons.append("very_suspicious")
+    return {
+        "candidate": cleaned,
+        "restored": restored,
+        "reasons": reasons,
+    }
+
+
+def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> dict:
+    cleaned = strip_label_prefix(candidate or "")
+    evaluation = evaluate_ass_line_candidate(state, cleaned, target_lang)
+    reasons = evaluation["reasons"]
+
+    # Recover common case where model translated text but dropped __TAG_n__ placeholders.
+    if "placeholder_mismatch" in reasons:
+        recovered = recover_ass_candidate_placeholders(state, cleaned)
+        if recovered is not None and recovered != cleaned:
+            evaluation = evaluate_ass_line_candidate(state, recovered, target_lang)
+            reasons = evaluation["reasons"]
 
     ok = len(reasons) == 0
     needs_llm_repair = any(
@@ -1501,8 +1574,8 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
     )
     return {
         "ok": ok,
-        "candidate": cleaned,
-        "restored": restored,
+        "candidate": evaluation["candidate"],
+        "restored": evaluation["restored"],
         "reasons": reasons,
         "needs_llm_repair": needs_llm_repair,
         "score": repair_issue_score(reasons),
@@ -1553,6 +1626,20 @@ def self_test_ass_repair_snippet() -> None:
     assert not has_label_prefix_artifact(cleaned_fixed)
     assert " i " not in f" {ass_plain_text(cleaned_fixed).lower()} "
     assert not has_target_language_leak(source_protected, cleaned_fixed, "Spanish")
+
+    recover_state = {
+        "text_field": "I was constructed with an\\N\"idealized human form\" body concept,",
+        "protected": "I was constructed with an__TAG_0__\"idealized human form\" body concept,",
+        "replacements": [("__TAG_0__", "\\N")],
+        "tokens": ["I was constructed with an", "\\N", "\"idealized human form\" body concept,"],
+    }
+    recovered = recover_ass_candidate_placeholders(
+        recover_state,
+        "Yo fui construido con una forma corporal de \"ser humano idealizada\",",
+    )
+    assert recovered is not None
+    recovered_status = scan_ass_line_candidate(recover_state, recovered, "Spanish")
+    assert "placeholder_mismatch" not in recovered_status["reasons"]
 
     # Quick scan test: only the problematic "ASS: I ..." line should require LLM repair.
     texts = [
@@ -2101,7 +2188,7 @@ def translate_srt(
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
 
-    ass_batch_cap = min(max(1, int(batch_size)), ASS_MAX_BATCH_ITEMS)
+    ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
     history: List[str] = []
     with progress_bar(console) as progress:
@@ -2239,7 +2326,7 @@ def translate_ass(
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
 
-    ass_batch_cap = min(max(1, int(batch_size)), ASS_MAX_BATCH_ITEMS)
+    ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
     severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
     history: List[str] = []
@@ -2798,11 +2885,15 @@ def apply_fast_profile(args, console) -> None:
         args.num_ctx = 4096
     if args.num_threads is None:
         args.num_threads = cpu_threads
+    if args.rolling_context > 0:
+        args.rolling_context = 0
+    if not args.skip_summary:
+        args.skip_summary = True
     gpu_display = args.num_gpu if args.num_gpu is not None else "auto"
     cprint(
         console,
         f"Fast profile: batch={args.batch_size}, ctx={args.num_ctx}, predict={args.num_predict}, "
-        f"threads={args.num_threads}, gpu={gpu_display}",
+        f"threads={args.num_threads}, gpu={gpu_display}, rolling={args.rolling_context}, summary=off",
         "bold cyan",
     )
 
