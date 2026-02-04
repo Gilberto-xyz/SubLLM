@@ -76,6 +76,12 @@ Con videos y subtitulos dentro de `SUBS_BULK/`:
 python GESTIONAR_subs_v1.py
 ```
 
+Modo semi-automatico para mux (sin preguntas de confirmacion extra en el flujo de mux):
+
+```bash
+python GESTIONAR_subs_v1.py --si
+```
+
 El script:
 
 - Detecta pistas de subtitulo disponibles por idioma.
@@ -85,7 +91,8 @@ El script:
 - Si hay subtitulo en espanol, lo marca como `default`.
 - Si `mkvmerge` esta disponible, lo usa automaticamente para mux de `.mkv`.
 - Puede reemplazar el video original (con backup opcional).
-- Al final pregunta si deseas borrar subtitulos ya muxeados.
+- Al final pregunta si deseas borrar subtitulos ya muxeados y, opcionalmente, los originales relacionados.
+- Con `--si` (si eliges mux), aplica automaticamente: reemplazar original, sin backup, borrar subtitulos muxeados y originales relacionados.
 
 ## Flujo recomendado
 

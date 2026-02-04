@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import argparse
 from collections import defaultdict
 
 VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
@@ -90,6 +91,16 @@ def ask_yes_no(prompt, default=False):
     if not raw:
         return default
     return raw in SI_VALUES
+
+
+def shorten_name(file_name, reserve=18):
+    width = shutil.get_terminal_size((120, 20)).columns
+    max_len = max(40, width - reserve)
+    if len(file_name) <= max_len:
+        return file_name
+    head = max(12, (max_len - 3) // 2)
+    tail = max(12, max_len - 3 - head)
+    return f"{file_name[:head]}...{file_name[-tail:]}"
 
 
 def find_mkvmerge_exe():
@@ -453,10 +464,10 @@ def seleccionar_video_para_sub(path, sub_name):
     if len(videos) == 1:
         return videos[0]
 
-    print(f"\nNo se pudo asociar automatico: {sub_name}")
+    print(f"\nNo se pudo asociar automatico: {shorten_name(sub_name)}")
     print("Selecciona el video destino:")
     for i, v in enumerate(videos, 1):
-        print(f" {i}. {v}")
+        print(f" {i}. {shorten_name(v)}")
     raw = input("Numero de video (Enter = omitir): ").strip()
     if not raw or not raw.isdigit():
         return None
@@ -621,7 +632,7 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
     if sin_video:
         print("\n[WARN] Subtitulos traducidos sin video base detectado:")
         for s in sin_video:
-            print(f"  - {s}")
+            print(f"  - {shorten_name(s)}")
 
     if not por_video:
         print("\nNo se detectaron subtitulos traducidos para muxear.")
@@ -671,7 +682,8 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
                 if not ok_replace:
                     fail += 1
                     print(
-                        f"[ERR] Mux generado pero no se pudo reemplazar '{video_name}'. Detalle: {exc}"
+                        f"[ERR] Mux generado pero no se pudo reemplazar "
+                        f"'{shorten_name(video_name)}'. Detalle: {exc}"
                     )
                     continue
                 final_label = video_name
@@ -681,12 +693,13 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
             ok += 1
             muxeados.extend(os.path.join(path, s) for s in sub_files)
             print(
-                f"[OK] Mux OK: {video_name} + {len(sub_files)} subtitulo(s) -> {final_label}"
+                f"[OK] Mux OK: {shorten_name(video_name)} + {len(sub_files)} "
+                f"subtitulo(s) -> {shorten_name(final_label)}"
             )
         else:
             fail += 1
             print(
-                f"[ERR] Error al muxear '{video_name}' ({mux_tool_name}). "
+                f"[ERR] Error al muxear '{shorten_name(video_name)}' ({mux_tool_name}). "
                 f"Detalle: {_last_error_line(err)}"
             )
 
@@ -698,20 +711,40 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
     return sorted(set(muxeados))
 
 
-def preguntar_borrado_subs(sub_paths):
+def preguntar_borrado_subs(sub_paths, auto_delete=False, auto_delete_originales=False):
     if not sub_paths:
         return
 
     print("\nSubtitulos traducidos usados en mux:")
     for sub_path in sub_paths:
-        print(f"  - {os.path.basename(sub_path)}")
+        print(f"  - {shorten_name(os.path.basename(sub_path))}")
 
-    if not ask_yes_no("\nQuieres eliminar estos subtitulos ya muxeados?", default=False):
+    if auto_delete:
+        print("\n[AUTO] Eliminacion de subtitulos muxeados: SI")
+    elif not ask_yes_no("\nQuieres eliminar estos subtitulos ya muxeados?", default=False):
         print("Se conservaron los subtitulos.")
         return
 
+    originales_relacionados = detectar_subs_originales_relacionados(sub_paths)
+    a_borrar = list(sub_paths)
+    eliminar_originales = False
+    if originales_relacionados:
+        print("\nSubtitulos originales relacionados detectados:")
+        for sub_path in originales_relacionados:
+            print(f"  - {shorten_name(os.path.basename(sub_path))}")
+        if auto_delete_originales:
+            eliminar_originales = True
+            print("[AUTO] Eliminacion de subtitulos originales relacionados: SI")
+        else:
+            eliminar_originales = ask_yes_no(
+                "Quieres eliminar tambien estos subtitulos originales?",
+                default=False,
+            )
+        if eliminar_originales:
+            a_borrar.extend(originales_relacionados)
+
     borrados, errores = 0, 0
-    for sub_path in sub_paths:
+    for sub_path in sorted(set(a_borrar)):
         try:
             os.remove(sub_path)
             borrados += 1
@@ -720,11 +753,56 @@ def preguntar_borrado_subs(sub_paths):
             print(f"[WARN] No se pudo borrar '{os.path.basename(sub_path)}': {exc}")
 
     print(f"Subtitulos borrados: {borrados}")
+    if originales_relacionados and not eliminar_originales:
+        print("Se conservaron los subtitulos originales relacionados.")
     if errores:
         print(f"[WARN] Errores al borrar: {errores}")
 
 
+def detectar_subs_originales_relacionados(sub_paths):
+    relacionados = set()
+    for sub_path in sub_paths:
+        folder = os.path.dirname(sub_path)
+        file_name = os.path.basename(sub_path)
+        stem, ext = os.path.splitext(file_name)
+        candidatos = set()
+
+        m = SUB_FILE_RE.match(file_name)
+        if m and m.group('suffix'):
+            candidatos.add(
+                f"{m.group('base')}_{m.group('lang')}_sub{m.group('idx')}{ext}"
+            )
+
+        m_last = re.match(r'^(?P<prefix>.+)_(?P<dest>[A-Za-z0-9_-]+)$', stem)
+        if m_last:
+            dest_norm = _normalize_lang_token(m_last.group('dest'))
+            if dest_norm in LANG_TITLE_MAP:
+                candidatos.add(f"{m_last.group('prefix')}{ext}")
+
+        for cand in candidatos:
+            cand_path = os.path.join(folder, cand)
+            if cand_path == sub_path:
+                continue
+            if os.path.isfile(cand_path):
+                relacionados.add(cand_path)
+
+    return sorted(relacionados)
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Gestiona extraccion y mux de subtitulos en SUBS_BULK."
+    )
+    parser.add_argument(
+        '--si',
+        action='store_true',
+        help=(
+            "Modo semi-automatico para mux: reemplaza original, sin backup, "
+            "borra subtitulos muxeados y originales relacionados sin preguntar."
+        ),
+    )
+    args = parser.parse_args()
+
     base_dir = os.path.abspath(os.path.dirname(__file__))
     bulk_dir = os.path.join(base_dir, 'SUBS_BULK')
     os.makedirs(bulk_dir, exist_ok=True)
@@ -746,13 +824,19 @@ def main():
 
     muxed_sub_paths = []
     if modo in {2, 3}:
-        reemplazar = ask_yes_no(
-            "\nQuieres reemplazar el archivo de video original al finalizar el mux?",
-            default=False,
-        )
-        backup = True
-        if reemplazar:
-            backup = ask_yes_no("Crear backup del original antes de reemplazar?", default=True)
+        if args.si:
+            reemplazar = True
+            backup = False
+            print("\n[AUTO --si] Reemplazar original: SI")
+            print("[AUTO --si] Crear backup: NO")
+        else:
+            reemplazar = ask_yes_no(
+                "\nQuieres reemplazar el archivo de video original al finalizar el mux?",
+                default=False,
+            )
+            backup = True
+            if reemplazar:
+                backup = ask_yes_no("Crear backup del original antes de reemplazar?", default=True)
 
         muxed_sub_paths = muxear_subs_traducidos(
             bulk_dir,
@@ -760,7 +844,11 @@ def main():
             crear_backup=backup,
         )
 
-    preguntar_borrado_subs(muxed_sub_paths)
+    preguntar_borrado_subs(
+        muxed_sub_paths,
+        auto_delete=args.si and modo in {2, 3},
+        auto_delete_originales=args.si and modo in {2, 3},
+    )
     return 0
 
 
