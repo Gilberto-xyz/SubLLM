@@ -10,7 +10,6 @@ Herramientas para trabajar subtitulos locales:
 
 - `translate_subs.py`: traduce subtitulos con contexto (resumen + guia de tono).
 - `GESTIONAR_subs_v1.py`: extrae y muxea subtitulos en `SUBS_BULK/`.
-- `EXTRAER_subs_v1.py`: wrapper de compatibilidad que delega a `GESTIONAR_subs_v1.py`.
 
 ## Requisitos
 
