@@ -19,6 +19,14 @@ import subprocess
 import argparse
 from collections import defaultdict
 
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
 VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
 SUB_EXTS = {'.srt', '.ass'}
 FFPROBE_FIELDS = 'stream=index,codec_type,codec_name:stream_tags=language'
@@ -83,6 +91,52 @@ LANG_TITLE_MAP = {
     'pol': 'Polish',
     'zho': 'Chinese',
 }
+
+
+CONSOLE = Console() if RICH_AVAILABLE else None
+
+
+def ui_print(message="", style=None):
+    if RICH_AVAILABLE:
+        CONSOLE.print(message, style=style)
+    else:
+        print(message)
+
+
+def ui_status(level, message):
+    labels = {
+        'ok': ('OK', 'green'),
+        'warn': ('WARN', 'yellow'),
+        'err': ('ERR', 'red'),
+        'run': ('RUN', 'cyan'),
+        'auto': ('AUTO', 'magenta'),
+        'info': ('INFO', 'blue'),
+    }
+    label, color = labels.get(level, ('INFO', 'blue'))
+    if RICH_AVAILABLE:
+        text = Text()
+        text.append(f"[{label}] ", style=f"bold {color}")
+        text.append(str(message))
+        CONSOLE.print(text)
+    else:
+        print(f"[{label}] {message}")
+
+
+def ui_section(title):
+    if RICH_AVAILABLE:
+        CONSOLE.rule(f"[bold cyan]{title}[/bold cyan]")
+    else:
+        print(f"\n-------- {title} --------")
+
+
+def ui_title(title, subtitle=None):
+    if RICH_AVAILABLE:
+        body = title if not subtitle else f"{title}\n[dim]{subtitle}[/dim]"
+        CONSOLE.print(Panel.fit(body, border_style="bright_blue"))
+    else:
+        print(f"\n=== {title} ===")
+        if subtitle:
+            print(subtitle)
 
 
 def ask_yes_no(prompt, default=False):
@@ -157,7 +211,7 @@ def scan_directory(path):
             '-of', 'json', os.path.join(path, f)
         ])
         if code != 0:
-            print(f"[WARN] ffprobe fallo en '{f}': {err.strip()}")
+            ui_status('warn', f"ffprobe fallo en '{shorten_name(f)}': {err.strip()}")
             continue
 
         try:
@@ -171,7 +225,7 @@ def scan_directory(path):
                 idiomas.add(lang)
                 streams.append((f, idx, lang, codec))
         except json.JSONDecodeError:
-            print(f"[WARN] No se pudo leer la salida de ffprobe para '{f}'.")
+            ui_status('warn', f"No se pudo leer la salida de ffprobe para '{shorten_name(f)}'.")
 
     return sorted(idiomas), streams
 
@@ -203,29 +257,32 @@ def extract_subs(path, streams, idiomas_sel):
 
         if code == 0 and os.path.isfile(out_path):
             ok += 1
-            print(f"[OK] Extraido {lang} | {codec.upper():<7} -> {out_file}")
+            ui_status('ok', f"Extraido {lang} | {codec.upper():<7} -> {shorten_name(out_file)}")
         else:
             fail += 1
             errores[file_name].append((idx, lang, codec))
-            print(
-                f"[ERR] Error al extraer {lang} | {codec.upper()} de '{file_name}'.\n"
-                f"   ffmpeg: {_last_error_line(err)}"
+            ui_status(
+                'err',
+                (
+                    f"Error al extraer {lang} | {codec.upper()} de "
+                    f"'{shorten_name(file_name)}'. ffmpeg: {_last_error_line(err)}"
+                ),
             )
 
-    print("\n-------- Resumen --------")
-    print(f"Subtitulos extraidos correctamente: {ok}")
+    ui_section("Resumen Extraccion")
+    ui_print(f"Subtitulos extraidos correctamente: {ok}", style="bold green" if RICH_AVAILABLE else None)
     if fail:
-        print(f"Subtitulos con error: {fail}")
+        ui_print(f"Subtitulos con error: {fail}", style="bold red" if RICH_AVAILABLE else None)
         for f, lst in errores.items():
             detalles = ', '.join(f"{i}:{l}" for i, l, _ in lst)
-            print(f"  - {f}: {detalles}")
+            ui_print(f"  - {shorten_name(f)}: {detalles}")
 
 
 def seleccionar_modo():
-    print("Modo de trabajo:")
-    print(" 1. Extraer subtitulos")
-    print(" 2. Muxear subtitulos traducidos")
-    print(" 3. Extraer y luego muxear")
+    ui_title("Modo de trabajo", "Selecciona que quieres hacer")
+    ui_print(" 1. Extraer subtitulos", style="cyan" if RICH_AVAILABLE else None)
+    ui_print(" 2. Muxear subtitulos traducidos", style="cyan" if RICH_AVAILABLE else None)
+    ui_print(" 3. Extraer y luego muxear", style="cyan" if RICH_AVAILABLE else None)
     raw = input("Elige una opcion [1-3] (default 3): ").strip()
     if raw in {'1', '2', '3'}:
         return int(raw)
@@ -233,9 +290,9 @@ def seleccionar_modo():
 
 
 def seleccionar_idiomas(idiomas):
-    print("Idiomas encontrados:")
+    ui_title("Idiomas encontrados")
     for i, lang in enumerate(idiomas, 1):
-        print(f" {i}. {lang}")
+        ui_print(f" {i}. {lang}", style="cyan" if RICH_AVAILABLE else None)
     sel = input("Elige los numeros de los idiomas a extraer (ej. 1,3): ")
     nums = [int(x.strip()) for x in sel.split(',') if x.strip().isdigit()]
     return [idiomas[i - 1] for i in nums if 0 < i <= len(idiomas)]
@@ -438,7 +495,13 @@ def get_subtitle_streams(video_path):
         video_path,
     ])
     if code != 0:
-        print(f"[WARN] No se pudo leer subtitulos existentes de '{os.path.basename(video_path)}': {err.strip()}")
+        ui_status(
+            'warn',
+            (
+                "No se pudo leer subtitulos existentes de "
+                f"'{shorten_name(os.path.basename(video_path))}': {err.strip()}"
+            ),
+        )
         return []
 
     try:
@@ -464,10 +527,10 @@ def seleccionar_video_para_sub(path, sub_name):
     if len(videos) == 1:
         return videos[0]
 
-    print(f"\nNo se pudo asociar automatico: {shorten_name(sub_name)}")
-    print("Selecciona el video destino:")
+    ui_status('warn', f"No se pudo asociar automatico: {shorten_name(sub_name)}")
+    ui_print("Selecciona el video destino:", style="bold yellow" if RICH_AVAILABLE else None)
     for i, v in enumerate(videos, 1):
-        print(f" {i}. {shorten_name(v)}")
+        ui_print(f" {i}. {shorten_name(v)}", style="cyan" if RICH_AVAILABLE else None)
     raw = input("Numero de video (Enter = omitir): ").strip()
     if not raw or not raw.isdigit():
         return None
@@ -630,18 +693,18 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
         sin_video = restantes
 
     if sin_video:
-        print("\n[WARN] Subtitulos traducidos sin video base detectado:")
+        ui_status('warn', "Subtitulos traducidos sin video base detectado:")
         for s in sin_video:
-            print(f"  - {shorten_name(s)}")
+            ui_print(f"  - {shorten_name(s)}", style="yellow" if RICH_AVAILABLE else None)
 
     if not por_video:
-        print("\nNo se detectaron subtitulos traducidos para muxear.")
-        print("Tip: se esperan nombres tipo *_subX_es-419.srt o *_eng_es-419.ass")
+        ui_status('info', "No se detectaron subtitulos traducidos para muxear.")
+        ui_print("Tip: se esperan nombres tipo *_subX_es-419.srt o *_eng_es-419.ass", style="dim")
         return []
 
     muxeados = []
     ok, fail = 0, 0
-    print("\n[RUN] Iniciando mux de subtitulos traducidos...\n")
+    ui_status('run', "Iniciando mux de subtitulos traducidos...")
 
     for video_name, sub_files in sorted(por_video.items()):
         sub_files = sorted(set(sub_files))
@@ -660,8 +723,12 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
         out_path = os.path.join(path, out_name)
 
         if reemplazar_original and ext_video != '.mkv':
-            print(
-                f"[WARN] '{video_name}' no es MKV; se crea salida separada ({out_name})."
+            ui_status(
+                'warn',
+                (
+                    f"'{shorten_name(video_name)}' no es MKV; se crea salida separada "
+                    f"({shorten_name(out_name)})."
+                ),
             )
 
         if ext_video == '.mkv' and mkvmerge_exe:
@@ -681,32 +748,41 @@ def muxear_subs_traducidos(path, reemplazar_original=False, crear_backup=True):
                 )
                 if not ok_replace:
                     fail += 1
-                    print(
-                        f"[ERR] Mux generado pero no se pudo reemplazar "
-                        f"'{shorten_name(video_name)}'. Detalle: {exc}"
+                    ui_status(
+                        'err',
+                        (
+                            "Mux generado pero no se pudo reemplazar "
+                            f"'{shorten_name(video_name)}'. Detalle: {exc}"
+                        ),
                     )
                     continue
                 final_label = video_name
                 if backup_path:
-                    print(f"[OK] Backup original: {os.path.basename(backup_path)}")
+                    ui_status('ok', f"Backup original: {shorten_name(os.path.basename(backup_path))}")
 
             ok += 1
             muxeados.extend(os.path.join(path, s) for s in sub_files)
-            print(
-                f"[OK] Mux OK: {shorten_name(video_name)} + {len(sub_files)} "
-                f"subtitulo(s) -> {shorten_name(final_label)}"
+            ui_status(
+                'ok',
+                (
+                    f"Mux OK: {shorten_name(video_name)} + {len(sub_files)} "
+                    f"subtitulo(s) -> {shorten_name(final_label)}"
+                ),
             )
         else:
             fail += 1
-            print(
-                f"[ERR] Error al muxear '{shorten_name(video_name)}' ({mux_tool_name}). "
-                f"Detalle: {_last_error_line(err)}"
+            ui_status(
+                'err',
+                (
+                    f"Error al muxear '{shorten_name(video_name)}' ({mux_tool_name}). "
+                    f"Detalle: {_last_error_line(err)}"
+                ),
             )
 
-    print("\n-------- Resumen Mux --------")
-    print(f"Videos muxeados correctamente: {ok}")
+    ui_section("Resumen Mux")
+    ui_print(f"Videos muxeados correctamente: {ok}", style="bold green" if RICH_AVAILABLE else None)
     if fail:
-        print(f"Videos con error en mux: {fail}")
+        ui_print(f"Videos con error en mux: {fail}", style="bold red" if RICH_AVAILABLE else None)
 
     return sorted(set(muxeados))
 
@@ -715,26 +791,26 @@ def preguntar_borrado_subs(sub_paths, auto_delete=False, auto_delete_originales=
     if not sub_paths:
         return
 
-    print("\nSubtitulos traducidos usados en mux:")
+    ui_title("Subtitulos traducidos usados en mux")
     for sub_path in sub_paths:
-        print(f"  - {shorten_name(os.path.basename(sub_path))}")
+        ui_print(f"  - {shorten_name(os.path.basename(sub_path))}", style="cyan" if RICH_AVAILABLE else None)
 
     if auto_delete:
-        print("\n[AUTO] Eliminacion de subtitulos muxeados: SI")
+        ui_status('auto', "Eliminacion de subtitulos muxeados: SI")
     elif not ask_yes_no("\nQuieres eliminar estos subtitulos ya muxeados?", default=False):
-        print("Se conservaron los subtitulos.")
+        ui_status('info', "Se conservaron los subtitulos.")
         return
 
     originales_relacionados = detectar_subs_originales_relacionados(sub_paths)
     a_borrar = list(sub_paths)
     eliminar_originales = False
     if originales_relacionados:
-        print("\nSubtitulos originales relacionados detectados:")
+        ui_title("Subtitulos originales relacionados detectados")
         for sub_path in originales_relacionados:
-            print(f"  - {shorten_name(os.path.basename(sub_path))}")
+            ui_print(f"  - {shorten_name(os.path.basename(sub_path))}", style="cyan" if RICH_AVAILABLE else None)
         if auto_delete_originales:
             eliminar_originales = True
-            print("[AUTO] Eliminacion de subtitulos originales relacionados: SI")
+            ui_status('auto', "Eliminacion de subtitulos originales relacionados: SI")
         else:
             eliminar_originales = ask_yes_no(
                 "Quieres eliminar tambien estos subtitulos originales?",
@@ -750,13 +826,13 @@ def preguntar_borrado_subs(sub_paths, auto_delete=False, auto_delete_originales=
             borrados += 1
         except OSError as exc:
             errores += 1
-            print(f"[WARN] No se pudo borrar '{os.path.basename(sub_path)}': {exc}")
+            ui_status('warn', f"No se pudo borrar '{shorten_name(os.path.basename(sub_path))}': {exc}")
 
-    print(f"Subtitulos borrados: {borrados}")
+    ui_status('ok', f"Subtitulos borrados: {borrados}")
     if originales_relacionados and not eliminar_originales:
-        print("Se conservaron los subtitulos originales relacionados.")
+        ui_status('info', "Se conservaron los subtitulos originales relacionados.")
     if errores:
-        print(f"[WARN] Errores al borrar: {errores}")
+        ui_status('warn', f"Errores al borrar: {errores}")
 
 
 def detectar_subs_originales_relacionados(sub_paths):
@@ -807,19 +883,19 @@ def main():
     bulk_dir = os.path.join(base_dir, 'SUBS_BULK')
     os.makedirs(bulk_dir, exist_ok=True)
 
-    print(f"Carpeta de trabajo: {bulk_dir}")
+    ui_title("Gestor de Subtitulos", f"Carpeta de trabajo: {bulk_dir}")
     modo = seleccionar_modo()
 
     if modo in {1, 3}:
         idiomas, streams = scan_directory(bulk_dir)
         if not streams:
-            print("\nNo se detectaron pistas de subtitulos en videos dentro de SUBS_BULK.")
+            ui_status('info', "No se detectaron pistas de subtitulos en videos dentro de SUBS_BULK.")
         else:
             idiomas_seleccionados = seleccionar_idiomas(idiomas)
             if not idiomas_seleccionados:
-                print("No se selecciono ningun idioma para extraer.")
+                ui_status('info', "No se selecciono ningun idioma para extraer.")
             else:
-                print(f"\n[RUN] Iniciando extraccion para: {', '.join(idiomas_seleccionados)}\n")
+                ui_status('run', f"Iniciando extraccion para: {', '.join(idiomas_seleccionados)}")
                 extract_subs(bulk_dir, streams, idiomas_seleccionados)
 
     muxed_sub_paths = []
@@ -827,8 +903,8 @@ def main():
         if args.si:
             reemplazar = True
             backup = False
-            print("\n[AUTO --si] Reemplazar original: SI")
-            print("[AUTO --si] Crear backup: NO")
+            ui_status('auto', "Reemplazar original: SI")
+            ui_status('auto', "Crear backup: NO")
         else:
             reemplazar = ask_yes_no(
                 "\nQuieres reemplazar el archivo de video original al finalizar el mux?",
