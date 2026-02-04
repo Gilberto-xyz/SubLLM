@@ -71,6 +71,7 @@ BULK_DIR_NAME = "SUBS_BULK"
 SINGLE_TRANSLATION_CACHE = {}
 REPAIR_BATCH_MAX = 8
 MAX_REPAIR_FALLBACK_LINES = 3
+ASS_MAX_BATCH_ITEMS = 12
 DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
@@ -79,6 +80,12 @@ TRANSLATION_SUMMARY_MAX = 600
 TRANSLATION_TONE_MAX = 400
 ROLLING_CONTEXT_MAX_CHARS = 600
 T = TypeVar("T")
+FORMAT_MODE = "auto"
+MINIFY_JSON_PROMPTS = True
+BENCH_MODE = False
+AUTO_JSON_DISABLED = False
+AUTO_JSON_ATTEMPTS = 0
+AUTO_JSON_FAILS = 0
 
 
 class SimpleConsole:
@@ -156,6 +163,34 @@ class RuntimeMetrics:
 RUNTIME_METRICS = RuntimeMetrics()
 
 
+def set_runtime_flags(format_mode: str, minify_json: bool, bench: bool) -> None:
+    global FORMAT_MODE, MINIFY_JSON_PROMPTS, BENCH_MODE
+    global AUTO_JSON_DISABLED, AUTO_JSON_ATTEMPTS, AUTO_JSON_FAILS
+    mode = (format_mode or "auto").strip().lower()
+    if mode not in {"auto", "json", "schema"}:
+        mode = "auto"
+    FORMAT_MODE = mode
+    MINIFY_JSON_PROMPTS = bool(minify_json)
+    BENCH_MODE = bool(bench)
+    AUTO_JSON_DISABLED = False
+    AUTO_JSON_ATTEMPTS = 0
+    AUTO_JSON_FAILS = 0
+
+
+def resolve_format_mode(mode: str | None = None) -> str:
+    selected = (mode or FORMAT_MODE or "auto").strip().lower()
+    if selected not in {"auto", "json", "schema"}:
+        return "auto"
+    return selected
+
+
+def dump_json(data: Any, *, minify: bool | None = None) -> str:
+    use_minify = MINIFY_JSON_PROMPTS if minify is None else bool(minify)
+    if use_minify:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(data, ensure_ascii=False)
+
+
 def print_runtime_breakdown(console, total_elapsed: float) -> None:
     summary_elapsed = RUNTIME_METRICS.seconds.get("stage.summary", 0.0)
     tone_elapsed = RUNTIME_METRICS.seconds.get("stage.tone_guide", 0.0)
@@ -194,6 +229,46 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
                 f"repair_batch={RUNTIME_METRICS.counters.get('retry.repair_batch.attempts', 0)} "
                 f"(items={RUNTIME_METRICS.counters.get('retry.repair_batch.items', 0)})"
             ),
+            "cyan",
+        )
+    batch_calls = RUNTIME_METRICS.counters.get("translate.json_batch.calls", 0)
+    top_batches = RUNTIME_METRICS.counters.get("translate.top_level_batches", 0)
+    if top_batches:
+        top_items = RUNTIME_METRICS.counters.get("translate.top_level_batch_items", 0)
+        cprint(
+            console,
+            f"Top-level batches: {top_batches} (avg_items={top_items / float(top_batches):.1f})",
+            "cyan",
+        )
+    if batch_calls:
+        batch_items = RUNTIME_METRICS.counters.get("translate.json_batch.items", 0)
+        batch_chars = RUNTIME_METRICS.counters.get("translate.json_batch.input_chars", 0)
+        avg_items = batch_items / float(batch_calls)
+        avg_chars = batch_chars / float(batch_calls)
+        cprint(
+            console,
+            f"Batch stats: calls={batch_calls}, avg_items={avg_items:.1f}, avg_input_chars={avg_chars:.0f}",
+            "cyan",
+        )
+    schema_retries = RUNTIME_METRICS.counters.get("format.schema_retry.attempts", 0)
+    if schema_retries:
+        cprint(console, f"Format fallbacks: schema_retry={schema_retries}", "cyan")
+    if resolve_format_mode() == "auto":
+        cprint(
+            console,
+            (
+                f"Auto-format stats: json_attempts={AUTO_JSON_ATTEMPTS}, "
+                f"json_fails={AUTO_JSON_FAILS}, json_disabled={AUTO_JSON_DISABLED}"
+            ),
+            "cyan",
+        )
+    ollama_calls = RUNTIME_METRICS.counters.get("ollama.calls", 0)
+    if ollama_calls:
+        avg_ollama = RUNTIME_METRICS.seconds.get("ollama.chat", 0.0) / float(ollama_calls)
+        avg_prompt_chars = RUNTIME_METRICS.counters.get("ollama.prompt_chars", 0) / float(ollama_calls)
+        cprint(
+            console,
+            f"Ollama calls: {ollama_calls} (avg={avg_ollama:.2f}s, avg_prompt_chars={avg_prompt_chars:.0f})",
             "cyan",
         )
 
@@ -245,8 +320,15 @@ class OllamaClient:
         if format is not None:
             payload["format"] = format
         url = f"{self.host}/api/chat"
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        data = dump_json(payload, minify=True).encode("utf-8")
         req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        prompt_chars = sum(len(str(msg.get("content", ""))) for msg in (messages or []))
+        format_name = "none"
+        if isinstance(format, str):
+            format_name = format
+        elif isinstance(format, dict):
+            format_name = "schema"
+        started = time.perf_counter()
         try:
             with request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -263,9 +345,24 @@ class OllamaClient:
             raise RuntimeError(
                 f"Cannot reach Ollama at {self.host}. Is it running?"
             ) from exc
+        elapsed = time.perf_counter() - started
+        RUNTIME_METRICS.seconds["ollama.chat"] += elapsed
+        RUNTIME_METRICS.calls["ollama.chat"] += 1
+        RUNTIME_METRICS.bump("ollama.calls")
+        RUNTIME_METRICS.bump("ollama.prompt_chars", prompt_chars)
+        RUNTIME_METRICS.bump("ollama.request_bytes", len(data))
+        if BENCH_MODE:
+            print(
+                f"[bench] ollama chat {elapsed:.2f}s format={format_name} "
+                f"prompt_chars={prompt_chars} request_bytes={len(data)}"
+            )
         try:
             payload = json.loads(body)
-            return payload["message"]["content"]
+            content = payload["message"]["content"]
+            RUNTIME_METRICS.bump("ollama.response_chars", len(content))
+            if BENCH_MODE:
+                print(f"[bench] ollama out_chars={len(content)}")
+            return content
         except Exception as exc:
             raise RuntimeError(f"Unexpected Ollama response: {body[:200]}") from exc
 
@@ -800,8 +897,9 @@ def translate_batch(
         "Fully translate every word from the source; do not drop connectors or leave source fragments. "
         f"{placeholder_rule}"
         "Respect sarcasm, double meanings, and register (formal/informal) as guided; do not neutralize tone. "
-        "Return ONLY a JSON array of strings, same length and order.\n\n"
-        f"Input JSON: {json.dumps(texts, ensure_ascii=False)}"
+        "Return ONLY a JSON array of strings, same length and order, in compact/minified JSON "
+        "(single line, no extra whitespace/newlines).\n\n"
+        f"Input JSON: {dump_json(texts)}"
     )
     with RUNTIME_METRICS.timed("translate.chat.batch_legacy"):
         content = client.chat(
@@ -895,15 +993,15 @@ def repair_batch(
             "- Fully translate remaining English fragments.\n"
             "- Keep placeholders __TAG_n__ exactly as in src (same count/order).\n"
             "- Do not add ASS tags/braces/control codes not present in src.\n"
-            "- Output ONLY JSON array of strings, same order/length.\n"
+            "- Output ONLY JSON array of strings, same order/length, as compact/minified JSON.\n"
         )
         if summary_short:
             user_msg += f"Summary hint: {summary_short}\n"
         if tone_short:
             user_msg += f"Tone hint: {tone_short}\n"
-        user_msg += f"Input JSON: {json.dumps(payload_items, ensure_ascii=False)}"
+        user_msg += f"Input JSON: {dump_json(payload_items)}"
         return [
-            {"role": "system", "content": "You are a subtitle translation fixer. Output ONLY JSON."},
+            {"role": "system", "content": "You are a subtitle translation fixer. Output ONLY compact/minified JSON."},
             {"role": "user", "content": user_msg},
         ]
 
@@ -1038,6 +1136,18 @@ def parse_array_response(content: str, expected_len: int) -> List[str] | None:
         data = json.loads(cleaned)
         if isinstance(data, list) and len(data) == expected_len:
             return [str(item) for item in data]
+        if expected_len == 1:
+            if isinstance(data, str):
+                return [data]
+            if isinstance(data, dict):
+                for key in ("translation", "translated", "text", "value", "output", "result"):
+                    value = data.get(key)
+                    if isinstance(value, str):
+                        return [value]
+                if len(data) == 1:
+                    only_value = next(iter(data.values()))
+                    if isinstance(only_value, str):
+                        return [only_value]
     except json.JSONDecodeError:
         pass
     fallback = extract_json_array(content)
@@ -1125,7 +1235,8 @@ def build_adaptive_batches(
             cur = [item]
             cur_tokens = in_tokens
             continue
-        fits_tokens = (cur_tokens + in_tokens + reserve_out) <= budget
+        # `budget` already discounts reserved output tokens, so avoid double subtraction.
+        fits_tokens = (cur_tokens + in_tokens) <= budget
         fits_count = len(cur) < cap
         if fits_tokens and fits_count:
             cur.append(item)
@@ -1165,7 +1276,7 @@ def build_translation_messages(
             "2) Do NOT introduce labels such as ASS:, SRT:, Dialogue:.\n"
             "3) Do NOT add braces/tags/control codes. Translate only natural language.\n"
             "4) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
-            "5) Output ONLY a JSON array of strings, same length/order.\n"
+            "5) Output ONLY a JSON array of strings, same length/order, as compact/minified JSON.\n"
         )
     else:
         user_msg = (
@@ -1174,16 +1285,16 @@ def build_translation_messages(
             "1) Keep line breaks in each item.\n"
             "2) Do NOT introduce labels such as ASS:, SRT:, Dialogue:.\n"
             "3) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
-            "4) Output ONLY a JSON array of strings, same length/order.\n"
+            "4) Output ONLY a JSON array of strings, same length/order, as compact/minified JSON.\n"
         )
 
     if context_blob:
         user_msg += context_blob + "\n"
-    user_msg += f"Input JSON: {json.dumps(texts, ensure_ascii=False)}"
+    user_msg += f"Input JSON: {dump_json(texts)}"
     return [
         {
             "role": "system",
-            "content": "You are a professional subtitle translator. Output only valid JSON.",
+            "content": "You are a professional subtitle translator. Output only valid compact/minified JSON.",
         },
         {"role": "user", "content": user_msg},
     ]
@@ -1200,9 +1311,21 @@ def translate_json_batch(
     rolling_context: str = "",
     force_temperature_zero: bool = False,
     timing_label: str = "translate.chat.batch_json",
+    format_mode: str | None = None,
 ) -> List[str] | None:
+    global AUTO_JSON_DISABLED, AUTO_JSON_ATTEMPTS, AUTO_JSON_FAILS
     if not texts:
         return []
+    input_json_chars = len(dump_json(texts))
+    RUNTIME_METRICS.bump("translate.json_batch.calls")
+    RUNTIME_METRICS.bump("translate.json_batch.items", len(texts))
+    RUNTIME_METRICS.bump("translate.json_batch.input_chars", input_json_chars)
+    selected_format_mode = resolve_format_mode(format_mode)
+    if BENCH_MODE:
+        print(
+            f"[bench] batch items={len(texts)} input_json_chars={input_json_chars} "
+            f"mode={mode} format_mode={selected_format_mode}"
+        )
     messages = build_translation_messages(
         texts=texts,
         target_lang=target_lang,
@@ -1217,9 +1340,49 @@ def translate_json_batch(
         texts=texts,
         force_temperature_zero=force_temperature_zero,
     )
+    if mode == "ass_protected" and not force_temperature_zero:
+        options_batch["temperature"] = 0.0
+    request_format: str | dict
+    used_auto_json = False
+    if selected_format_mode == "schema":
+        request_format = schema
+    elif selected_format_mode == "auto" and (
+        force_temperature_zero or len(texts) <= 2 or AUTO_JSON_DISABLED or mode == "ass_protected"
+    ):
+        request_format = schema
+    else:
+        request_format = "json"
+        used_auto_json = selected_format_mode == "auto"
     with RUNTIME_METRICS.timed(timing_label):
-        content = client.chat(messages, options=options_batch, format=schema)
-    return parse_array_response(content, len(texts))
+        content = client.chat(messages, options=options_batch, format=request_format)
+    parsed = parse_array_response(content, len(texts))
+    if parsed is not None:
+        if used_auto_json:
+            AUTO_JSON_ATTEMPTS += 1
+        return parsed
+    if used_auto_json:
+        AUTO_JSON_ATTEMPTS += 1
+        AUTO_JSON_FAILS += 1
+        fail_rate = AUTO_JSON_FAILS / float(max(1, AUTO_JSON_ATTEMPTS))
+        if AUTO_JSON_ATTEMPTS >= 10 and AUTO_JSON_FAILS >= 4 and fail_rate >= 0.25:
+            AUTO_JSON_DISABLED = True
+            if BENCH_MODE:
+                print(
+                    f"[bench] auto json disabled (attempts={AUTO_JSON_ATTEMPTS}, "
+                    f"fails={AUTO_JSON_FAILS}, fail_rate={fail_rate:.2f})"
+                )
+    if selected_format_mode != "auto":
+        return None
+    # Fast path in auto mode: retry once with strict schema + temp=0 only on parse/length failure.
+    RUNTIME_METRICS.bump("format.schema_retry.attempts")
+    schema_options = build_options_for_batch(
+        options=options,
+        texts=texts,
+        force_temperature_zero=True,
+    )
+    with RUNTIME_METRICS.timed(f"{timing_label}.schema_retry"):
+        strict_content = client.chat(messages, options=schema_options, format=schema)
+    return parse_array_response(strict_content, len(texts))
 
 
 def translate_json_batch_with_split(
@@ -1233,6 +1396,7 @@ def translate_json_batch_with_split(
     rolling_context: str = "",
     force_temperature_zero: bool = False,
     timing_label: str = "translate.chat.batch_json",
+    format_mode: str | None = None,
 ) -> List[str | None]:
     if not texts:
         return []
@@ -1248,6 +1412,7 @@ def translate_json_batch_with_split(
             rolling_context=rolling_context,
             force_temperature_zero=force_temperature_zero,
             timing_label=timing_label,
+            format_mode=format_mode,
         )
     except OllamaTimeoutError:
         out = None
@@ -1274,6 +1439,7 @@ def translate_json_batch_with_split(
         rolling_context=rolling_context,
         force_temperature_zero=force_temperature_zero,
         timing_label=timing_label,
+        format_mode=format_mode,
     )
     right = translate_json_batch_with_split(
         client,
@@ -1286,6 +1452,7 @@ def translate_json_batch_with_split(
         rolling_context=rolling_context,
         force_temperature_zero=force_temperature_zero,
         timing_label=timing_label,
+        format_mode=format_mode,
     )
     return left + right
 
@@ -1641,19 +1808,20 @@ def translate_ass_slots_single(
         "2) Do NOT add labels like ASS:, SRT:, Dialogue:.\n"
         "3) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
         "4) Do NOT add braces/tags/control codes.\n"
+        "5) Output must be compact/minified JSON (single line, no extra whitespace/newlines).\n"
     )
     if summary_short:
         user_msg += f"Summary hint: {summary_short}\n"
     if tone_short:
         user_msg += f"Tone hint: {tone_short}\n"
-    user_msg += f"Full line plain text: {full_plain}\nInput slots JSON: {json.dumps(slots, ensure_ascii=False)}"
+    user_msg += f"Full line plain text: {full_plain}\nInput slots JSON: {dump_json(slots)}"
     try:
         schema = build_fixed_array_schema(len(slots))
-        options_batch = build_options_for_batch(options, slots)
+        options_batch = build_options_for_batch(options, slots, force_temperature_zero=True)
         with RUNTIME_METRICS.timed("retry.chat.ass_slot_single"):
             content = client.chat(
                 [
-                    {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                    {"role": "system", "content": "You translate subtitle slots. Output only compact/minified JSON."},
                     {"role": "user", "content": user_msg},
                 ],
                 options=options_batch,
@@ -1704,23 +1872,25 @@ def translate_ass_slots_batch_with_split(
         "3) Do NOT add labels like ASS:, SRT:, Dialogue:.\n"
         "4) Do not translate content inside square brackets [like this]; preserve it exactly.\n"
         "5) Do NOT add braces/tags/control codes.\n"
+        "6) Output must be compact/minified JSON (single line, no extra whitespace/newlines).\n"
     )
     if summary_short:
         user_msg += f"Summary hint: {summary_short}\n"
     if tone_short:
         user_msg += f"Tone hint: {tone_short}\n"
-    user_msg += f"Input JSON: {json.dumps(payload, ensure_ascii=False)}"
+    user_msg += f"Input JSON: {dump_json(payload)}"
 
     try:
         schema = build_fixed_array_of_arrays_schema(len(items))
         options_batch = build_options_for_batch(
             options,
-            [json.dumps(entry, ensure_ascii=False) for entry in payload],
+            [dump_json(entry) for entry in payload],
+            force_temperature_zero=True,
         )
         with RUNTIME_METRICS.timed("retry.chat.ass_slot_batch"):
             content = client.chat(
                 [
-                    {"role": "system", "content": "You translate subtitle slots. Output only JSON."},
+                    {"role": "system", "content": "You translate subtitle slots. Output only compact/minified JSON."},
                     {"role": "user", "content": user_msg},
                 ],
                 options=options_batch,
@@ -1786,8 +1956,7 @@ def run_ass_surgical_fallback(
                 item["forced_restored"] = repaired
         return
     if total > 20:
-        cprint(console, "Repair set is large; skipping surgical fallback for this batch.", "yellow")
-        return
+        cprint(console, f"Large ASS repair set ({total}); applying chunked surgical fallback.", "yellow")
     for chunk in batched(failed_items, 8):
         repaired_lines = translate_ass_slots_batch_with_split(
             client,
@@ -1823,6 +1992,7 @@ def fallback_srt_linewise(
         mode="srt_block",
         rolling_context="",
         timing_label="retry.chat.srt_linewise",
+        format_mode="schema",
     )
     if len(out_lines) != len(source_lines):
         return None
@@ -1858,6 +2028,7 @@ def retry_single_item_translation(
         rolling_context="",
         force_temperature_zero=True,
         timing_label="retry.chat.single_item",
+        format_mode="schema",
     )
     if not out or out[0] is None:
         return None
@@ -1872,6 +2043,7 @@ def retry_failed_items_batch(
     target_lang: str,
     options,
     mode: str,
+    format_mode: str | None = "schema",
 ) -> None:
     """Reintenta en batch (temp=0 + schema) para evitar N llamadas 1x1 cuando el batch salió muy mal."""
     if not failed_items:
@@ -1890,6 +2062,7 @@ def retry_failed_items_batch(
         rolling_context="",
         force_temperature_zero=True,
         timing_label="retry.chat.batch_temp0",
+        format_mode=format_mode,
     )
     for it, cand in zip(failed_items, out):
         if cand is None:
@@ -1928,11 +2101,14 @@ def translate_srt(
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
 
-    batches = build_adaptive_batches(translatable_items, batch_size, options, one_shot, console)
+    ass_batch_cap = min(max(1, int(batch_size)), ASS_MAX_BATCH_ITEMS)
+    batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
     history: List[str] = []
     with progress_bar(console) as progress:
         task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
+            RUNTIME_METRICS.bump("translate.top_level_batches", 1)
+            RUNTIME_METRICS.bump("translate.top_level_batch_items", len(batch))
             sources = [item["protected_text"] for item in batch]
             context_hint = rolling_context_snippet(history, rolling_context)
             out = translate_json_batch_with_split(
@@ -1958,7 +2134,15 @@ def translate_srt(
                     f"High fail-rate: {len(failed_items)}/{len(batch)} SRT flagged. Retrying batch @temp=0...",
                     "yellow",
                 )
-                retry_failed_items_batch(client, failed_items, summary, tone_guide, target_lang, options, mode="srt_block")
+                retry_failed_items_batch(
+                    client,
+                    failed_items,
+                    summary,
+                    tone_guide,
+                    target_lang,
+                    options,
+                    mode="srt_block",
+                )
                 failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
             if failed_items:
                 for item in failed_items:
@@ -2055,13 +2239,16 @@ def translate_ass(
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
 
-    batches = build_adaptive_batches(translatable_items, batch_size, options, one_shot, console)
+    ass_batch_cap = min(max(1, int(batch_size)), ASS_MAX_BATCH_ITEMS)
+    batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
     severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
     history: List[str] = []
 
     with progress_bar(console) as progress:
         task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
+            RUNTIME_METRICS.bump("translate.top_level_batches", 1)
+            RUNTIME_METRICS.bump("translate.top_level_batch_items", len(batch))
             sources = [item["protected_text"] for item in batch]
             context_hint = rolling_context_snippet(history, rolling_context)
             out = translate_json_batch_with_split(
@@ -2084,12 +2271,13 @@ def translate_ass(
 
             failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
             repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
-            if failed_items and len(failed_items) > repair_limit:
-                cprint(
-                    console,
-                    f"High fail-rate: {len(failed_items)}/{len(batch)} ASS flagged. Retrying batch @temp=0...",
-                    "yellow",
-                )
+            if failed_items:
+                if len(failed_items) > repair_limit:
+                    cprint(
+                        console,
+                        f"High fail-rate: {len(failed_items)}/{len(batch)} ASS flagged. Retrying batch @temp=0...",
+                        "yellow",
+                    )
                 retry_failed_items_batch(
                     client,
                     failed_items,
@@ -2098,6 +2286,7 @@ def translate_ass(
                     target_lang,
                     options,
                     mode="ass_protected",
+                    format_mode="schema",
                 )
                 failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
             if failed_items:
@@ -2643,8 +2832,29 @@ def main() -> int:
     parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
     parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
     parser.add_argument("--rolling-context", type=int, default=2, help="Use last N translated lines as rolling context")
+    parser.add_argument(
+        "--format-mode",
+        choices=["auto", "json", "schema"],
+        default="auto",
+        help="Structured output mode: auto=json fast path + schema retry, json=always json, schema=always schema",
+    )
+    parser.add_argument(
+        "--minify-json",
+        dest="minify_json",
+        action="store_true",
+        default=True,
+        help="Minify JSON payload embedded in prompts (default: on)",
+    )
+    parser.add_argument(
+        "--no-minify-json",
+        dest="minify_json",
+        action="store_false",
+        help="Disable minified JSON payloads in prompts",
+    )
+    parser.add_argument("--bench", action="store_true", help="Enable detailed per-call bench logging")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
     args = parser.parse_args()
+    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
 
     if args.self_test:
         self_test_ass_repair_snippet()
@@ -2672,6 +2882,16 @@ def main() -> int:
         out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
 
     apply_fast_profile(args, console)
+    set_runtime_flags(args.format_mode, args.minify_json, args.bench)
+    if args.bench:
+        cprint(
+            console,
+            (
+                f"Bench mode ON | format_mode={resolve_format_mode()} | "
+                f"minify_json={'on' if MINIFY_JSON_PROMPTS else 'off'}"
+            ),
+            "bold cyan",
+        )
 
     text, line_ending, final_newline, bom = read_text(in_path)
     ext = in_path.suffix.lower()
