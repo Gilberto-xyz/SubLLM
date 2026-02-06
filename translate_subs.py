@@ -2679,7 +2679,23 @@ def detect_language(text: str) -> Tuple[str, float]:
 
 
 def bulk_dir() -> Path:
-    return Path.cwd() / BULK_DIR_NAME
+    """Return the directory where bulk subtitle files live.
+
+    Historically this script expects to be run from the project root, with
+    subtitles under ./SUBS_BULK. In practice users often run it while already
+    inside SUBS_BULK, so we treat the current directory as the bulk directory
+    when it looks like one.
+    """
+    cwd = Path.cwd()
+    if cwd.name.lower() == BULK_DIR_NAME.lower():
+        return cwd
+    default = cwd / BULK_DIR_NAME
+    if default.exists():
+        return default
+    # Fallback: if the current directory already contains subtitles, use it.
+    if any(cwd.glob("*.ass")) or any(cwd.glob("*.srt")):
+        return cwd
+    return default
 
 
 def resolve_input_path(path_like: str | Path) -> Path:
@@ -2705,6 +2721,41 @@ def list_subtitle_files(exts: List[str]) -> List[Path]:
         files.extend(base_dir.glob(f"*{ext}"))
         files.extend(base_dir.glob(f"*{ext.upper()}"))
     return sorted(set(files))
+
+
+def _parse_index_selection(raw: str, max_index: int) -> List[int]:
+    """Parse selections like: '1 2 5', '1,3-6', 'all'.
+
+    Returns a list of 1-based indexes (deduped, sorted). Empty list means "no indexes".
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return []
+    if text in {"all", "*"}:
+        return list(range(1, max_index + 1))
+
+    # Tokenize by commas/whitespace.
+    tokens = [t for t in re.split(r"[,\s]+", text) if t]
+    out: set[int] = set()
+    for tok in tokens:
+        if re.fullmatch(r"\d+", tok):
+            idx = int(tok)
+            if 1 <= idx <= max_index:
+                out.add(idx)
+            continue
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", tok)
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2))
+            lo, hi = (a, b) if a <= b else (b, a)
+            lo = max(lo, 1)
+            hi = min(hi, max_index)
+            for idx in range(lo, hi + 1):
+                out.add(idx)
+            continue
+        # Non-index token: let caller treat it as a path/glob.
+        return []
+    return sorted(out)
 
 
 def get_installed_models_list() -> List[str]:
@@ -2841,33 +2892,47 @@ def collect_batch_inputs(raw_input: str | None, target_lang: str) -> List[Path]:
     return sorted(out)
 
 
-def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, str]:
+def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int | None, bool, str]:
     files = list_subtitle_files([".srt"])
     if not files:
         files = list_subtitle_files([".ass"])
-    in_path = None
+    in_paths: List[Path] = []
     if files:
         cprint(console, "Subtitle files found:", "bold cyan")
         for i, f in enumerate(files, 1):
             console.print(f"  {i}) {f.name}")
-        raw = input("Select a file number or type a path: ").strip()
-        if raw.isdigit():
-            idx = int(raw)
-            if 1 <= idx <= len(files):
-                in_path = files[idx - 1]
+        raw = input("Select file number(s) (e.g. 1 3 5, 1-4) or type a path (or 'all'): ").strip()
+
+        idxs = _parse_index_selection(raw, len(files))
+        if idxs:
+            in_paths = [files[i - 1] for i in idxs]
         elif raw:
-            in_path = resolve_input_path(raw)
+            candidate = resolve_input_path(raw)
+            if candidate.exists():
+                in_paths = [candidate]
+            else:
+                matches = [f for f in files if fnmatch.fnmatch(f.name, raw)]
+                in_paths = matches
         else:
             if len(files) == 1:
-                in_path = files[0]
-    if in_path is None:
-        raw = input("Enter subtitle file path: ").strip()
-        in_path = resolve_input_path(raw)
-    if not in_path.exists():
-        raise RuntimeError(f"Input not found: {in_path}")
+                in_paths = [files[0]]
+    if not in_paths:
+        raw = input("Enter subtitle file path (or 'all'): ").strip()
+        idxs = _parse_index_selection(raw, len(files))
+        if idxs and files:
+            in_paths = [files[i - 1] for i in idxs]
+        elif raw and raw.strip().lower() in {"all", "*"} and files:
+            in_paths = files[:]
+        else:
+            in_paths = [resolve_input_path(raw)]
 
-    text, _, _, _ = read_text(in_path)
-    ext = in_path.suffix.lower()
+    missing = [p for p in in_paths if not p.exists()]
+    if missing:
+        raise RuntimeError(f"Input not found: {missing[0]}")
+
+    sample_path = in_paths[0]
+    text, _, _, _ = read_text(sample_path)
+    ext = sample_path.suffix.lower()
     if ext == ".ass":
         sample_lines = collect_plain_lines_ass(text)
     else:
@@ -2904,11 +2969,16 @@ def interactive_flow(args, console) -> Tuple[Path, Path, str, int | None, bool, 
 
     model = choose_model(console, args.model)
 
-    out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, target_lang)
-    cprint(console, f"Output file: {out_path}", "bold cyan")
+    out_path = None
+    if len(in_paths) == 1:
+        out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(sample_path, target_lang)
+        cprint(console, f"Output file: {out_path}", "bold cyan")
+    else:
+        cprint(console, f"Selected files: {len(in_paths)}", "bold cyan")
+        cprint(console, "Output files will be generated per input file.", "bold cyan")
     if skip_summary:
         cprint(console, "Sample mode: skipping summary for speed.", "yellow")
-    return in_path, out_path, target_lang, limit, skip_summary, model
+    return in_paths, out_path, target_lang, limit, skip_summary, model
 
 
 def apply_fast_profile(args, console) -> None:
@@ -3091,12 +3161,12 @@ def main() -> int:
         print("--out is not supported in --batch mode", file=sys.stderr)
         return 2
 
-    in_path = None
+    in_paths: List[Path] = []
     out_path = None
     if not args.batch:
         if args.interactive or not args.in_path:
             try:
-                in_path, out_path, args.target, args.limit, skip_summary, model = interactive_flow(
+                in_paths, out_path, args.target, args.limit, skip_summary, model = interactive_flow(
                     args, console
                 )
             except RuntimeError as exc:
@@ -3111,6 +3181,7 @@ def main() -> int:
             if not in_path.exists():
                 print(f"Input not found: {in_path}", file=sys.stderr)
                 return 2
+            in_paths = [in_path]
             out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
 
     apply_fast_profile(args, console)
@@ -3157,6 +3228,43 @@ def main() -> int:
         )
         return 0 if failed == 0 else 1
 
+    if not in_paths:
+        print("No input selected.", file=sys.stderr)
+        return 2
+
+    # If the user selected multiple files interactively, run a mini-batch.
+    if len(in_paths) > 1:
+        if args.out_path:
+            print("--out is not supported when translating multiple inputs", file=sys.stderr)
+            return 2
+
+        ok = 0
+        skipped = 0
+        failed = 0
+        for file_path in in_paths:
+            out_file = build_output_path(file_path, args.target)
+            if out_file.exists() and not args.overwrite:
+                skipped += 1
+                cprint(console, f"Skip (exists): {out_file.name}", "yellow")
+                continue
+
+            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+            code = translate_single_file(client, console, args, file_path, out_file)
+            if code == 0:
+                ok += 1
+            else:
+                failed += 1
+
+        cprint(
+            console,
+            f"\nMulti-file summary -> ok: {ok}, skipped: {skipped}, failed: {failed}",
+            "bold cyan" if failed == 0 else "bold yellow",
+        )
+        return 0 if failed == 0 else 1
+
+    in_path = in_paths[0]
+    if out_path is None:
+        out_path = build_output_path(in_path, args.target)
     return translate_single_file(client, console, args, in_path, out_path)
 
 

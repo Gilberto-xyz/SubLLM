@@ -2,13 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 GESTIONAR_subs_v1.py
-Version 3.0 - 04-feb-2026
+Version 3.2 - 06-feb-2026
 
 - Usa SUBS_BULK como carpeta de trabajo para videos y subtitulos.
 - Extrae subtitulos de los videos detectados.
 - Muxea subtitulos traducidos, fija metadatos y marca espanol como default.
 - Puede reemplazar el video original (con backup opcional).
 - Al final pregunta si deseas borrar subtitulos ya muxeados.
+
+Mejoras 3.1:
+- Escaneo mas rapido de pistas de subtitulos (cache + paralelo).
+- En el listado de idiomas muestra cantidad de pistas por idioma.
+- Tras extraer, muestra un resumen por video/idioma con peso y cantidad de lineas/entradas.
+
+Mejoras 3.2:
+- Seleccion automatica de la mejor pista/archivo cuando hay duplicados del mismo idioma.
+  (Evita subs tipo SDH/full con canciones/SFX cuando existe una alternativa mas limpia.)
 """
 
 import json
@@ -18,6 +27,10 @@ import shutil
 import subprocess
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     from rich.console import Console
@@ -94,6 +107,17 @@ LANG_TITLE_MAP = {
 
 
 CONSOLE = Console() if RICH_AVAILABLE else None
+LANGUAGE_COUNT_HINT = {}
+DISCARD_DIR_NAME = "__subs_descartados"
+
+SDH_CUE_RE = re.compile(
+    r"(music|song|sfx|sound|applause|laugh|laughter|sigh|gasp|grunt|groan|pant|breath|breathing|"
+    r"footsteps|door|knock|ring|phone|wind|rain|thunder|cry|sob|whisper|moan|slap|kiss)",
+    flags=re.IGNORECASE,
+)
+BRACKETED_RE = re.compile(r"^\s*[\[(].{0,120}[\])]\s*$")
+ASS_DIALOGUE_RE = re.compile(r"^Dialogue:", flags=re.IGNORECASE)
+ASS_TAG_STRIP_RE = re.compile(r"\{[^}]*\}")
 
 
 def ui_print(message="", style=None):
@@ -187,45 +211,208 @@ def _last_error_line(stderr_text):
 
 
 def list_video_files(path):
-    return sorted(
-        f for f in os.listdir(path)
-        if os.path.splitext(f)[1].lower() in VIDEO_EXTS
-    )
+    # scandir is materially faster than listdir when there are many files.
+    out = []
+    with os.scandir(path) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            _, ext = os.path.splitext(entry.name)
+            if ext.lower() in VIDEO_EXTS:
+                out.append(entry.name)
+    out.sort()
+    return out
 
 
 def list_subtitle_files(path):
-    return sorted(
-        f for f in os.listdir(path)
-        if os.path.splitext(f)[1].lower() in SUB_EXTS
-    )
+    out = []
+    with os.scandir(path) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            _, ext = os.path.splitext(entry.name)
+            if ext.lower() in SUB_EXTS:
+                out.append(entry.name)
+    out.sort()
+    return out
 
 
-def scan_directory(path):
-    idiomas, streams = set(), []
+@dataclass(frozen=True)
+class VideoKey:
+    name: str
+    size: int
+    mtime_ns: int
 
-    for f in list_video_files(path):
-        code, out, err = _run([
-            'ffprobe', '-v', 'error',
-            '-select_streams', 's',
-            '-show_entries', FFPROBE_FIELDS,
-            '-of', 'json', os.path.join(path, f)
-        ])
-        if code != 0:
-            ui_status('warn', f"ffprobe fallo en '{shorten_name(f)}': {err.strip()}")
-            continue
 
+def _scan_cache_path(folder: str) -> str:
+    return os.path.join(folder, ".subs_scan_cache.json")
+
+
+def _load_scan_cache(folder: str) -> Dict[str, dict]:
+    cache_path = _scan_cache_path(folder)
+    if not os.path.isfile(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("videos"), dict):
+            return data["videos"]
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_scan_cache(folder: str, videos_cache: Dict[str, dict]) -> None:
+    cache_path = _scan_cache_path(folder)
+    tmp_path = cache_path + ".tmp"
+    payload = {"version": 1, "videos": videos_cache}
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, cache_path)
+    except Exception:
         try:
-            data = json.loads(out)
-            for s in data.get('streams', []):
-                if s.get('codec_type') != 'subtitle':
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _video_key(folder: str, file_name: str) -> Optional[VideoKey]:
+    path = os.path.join(folder, file_name)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return VideoKey(name=file_name, size=int(st.st_size), mtime_ns=int(st.st_mtime_ns))
+
+
+def _ffprobe_subtitle_streams(folder: str, file_name: str) -> Tuple[List[Tuple[str, int, str, str]], List[str]]:
+    """Return (streams, langs) for one video file."""
+    idiomas, streams = set(), []
+    code, out, err = _run([
+        'ffprobe', '-v', 'error',
+        '-select_streams', 's',
+        '-show_entries', FFPROBE_FIELDS,
+        '-of', 'json', os.path.join(folder, file_name)
+    ])
+    if code != 0:
+        ui_status('warn', f"ffprobe fallo en '{shorten_name(file_name)}': {err.strip()}")
+        return [], []
+
+    try:
+        data = json.loads(out)
+        for s in data.get('streams', []):
+            if s.get('codec_type') != 'subtitle':
+                continue
+            idx = s['index']
+            codec = s.get('codec_name', 'unknown')
+            lang = (s.get('tags', {}) or {}).get('language', 'und')
+            idiomas.add(lang)
+            streams.append((file_name, idx, lang, codec))
+    except json.JSONDecodeError:
+        ui_status('warn', f"No se pudo leer la salida de ffprobe para '{shorten_name(file_name)}'.")
+        return [], []
+
+    return streams, sorted(idiomas)
+
+
+def _summarize_streams_by_language(streams: List[Tuple[str, int, str, str]]):
+    by_lang = defaultdict(list)
+    for file_name, idx, lang, codec in streams:
+        by_lang[lang].append((file_name, idx, codec))
+    return by_lang
+
+
+def _print_duplicate_streams(streams: List[Tuple[str, int, str, str]]) -> None:
+    """Show per-video languages that have multiple subtitle streams."""
+    by_video = defaultdict(list)
+    for video_name, idx, lang, codec in streams:
+        by_video[video_name].append((lang, idx, codec))
+
+    duplicates = []
+    for video_name, lst in by_video.items():
+        per_lang = defaultdict(list)
+        for lang, idx, codec in lst:
+            per_lang[lang].append((idx, codec))
+        for lang, items in per_lang.items():
+            if len(items) > 1:
+                duplicates.append((video_name, lang, items))
+
+    if not duplicates:
+        return
+
+    ui_section("Detalle Pistas Duplicadas")
+    ui_print("Videos con mas de 1 pista de subtitulo por idioma:", style="bold yellow" if RICH_AVAILABLE else None)
+    for video_name, lang, items in sorted(duplicates, key=lambda x: (x[0].lower(), x[1].lower())):
+        codecs = defaultdict(int)
+        for _, codec in items:
+            codecs[str(codec).lower()] += 1
+        codecs_str = ", ".join(f"{k}={v}" for k, v in sorted(codecs.items()))
+        ui_print(f"- {shorten_name(video_name)} | {lang}: {len(items)} pista(s) ({codecs_str})")
+
+
+def scan_directory(path, *, workers=6, use_cache=True):
+    """Scan subtitle streams inside videos in `path`.
+
+    Returns (idiomas, streams).
+    streams -> list[(video_file, ffprobe_stream_index, lang, codec)]
+    """
+    idiomas, streams = set(), []
+    videos = list_video_files(path)
+    if not videos:
+        return [], []
+
+    videos_cache = _load_scan_cache(path) if use_cache else {}
+    cache_changed = False
+
+    to_probe: List[Tuple[VideoKey, str]] = []
+    for f in videos:
+        key = _video_key(path, f)
+        if key is None:
+            continue
+        cached = videos_cache.get(f)
+        if cached and cached.get("size") == key.size and cached.get("mtime_ns") == key.mtime_ns:
+            cached_streams = cached.get("streams") or []
+            for item in cached_streams:
+                try:
+                    streams.append((f, int(item["index"]), str(item.get("lang") or "und"), str(item.get("codec") or "unknown")))
+                    idiomas.add(str(item.get("lang") or "und"))
+                except Exception:
+                    # If cache is malformed, just re-probe this file.
+                    to_probe.append((key, f))
+                    break
+        else:
+            to_probe.append((key, f))
+
+    if to_probe:
+        ui_status("run", f"Escaneando pistas de subtitulos (ffprobe) en {len(to_probe)}/{len(videos)} videos...")
+
+        max_workers = max(1, int(workers or 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_ffprobe_subtitle_streams, path, f): (key, f) for key, f in to_probe}
+            for fut in as_completed(futs):
+                key, f = futs[fut]
+                try:
+                    s, langs = fut.result()
+                except Exception as exc:
+                    ui_status("warn", f"ffprobe fallo en '{shorten_name(f)}': {exc}")
                     continue
-                idx = s['index']
-                codec = s.get('codec_name', 'unknown')
-                lang = s.get('tags', {}).get('language', 'und')
-                idiomas.add(lang)
-                streams.append((f, idx, lang, codec))
-        except json.JSONDecodeError:
-            ui_status('warn', f"No se pudo leer la salida de ffprobe para '{shorten_name(f)}'.")
+
+                for file_name, idx, lang, codec in s:
+                    streams.append((file_name, idx, lang, codec))
+                    idiomas.add(lang)
+
+                if use_cache:
+                    videos_cache[f] = {
+                        "size": key.size,
+                        "mtime_ns": key.mtime_ns,
+                        "streams": [{"index": idx, "lang": lang, "codec": codec} for _, idx, lang, codec in s],
+                    }
+                    cache_changed = True
+
+    if use_cache and cache_changed:
+        _save_scan_cache(path, videos_cache)
 
     return sorted(idiomas), streams
 
@@ -233,6 +420,7 @@ def scan_directory(path):
 def extract_subs(path, streams, idiomas_sel):
     ok, fail = 0, 0
     errores = defaultdict(list)
+    extracted_paths = []
 
     for file_name, idx, lang, codec in streams:
         if lang not in idiomas_sel:
@@ -257,6 +445,7 @@ def extract_subs(path, streams, idiomas_sel):
 
         if code == 0 and os.path.isfile(out_path):
             ok += 1
+            extracted_paths.append(out_path)
             ui_status('ok', f"Extraido {lang} | {codec.upper():<7} -> {shorten_name(out_file)}")
         else:
             fail += 1
@@ -277,6 +466,12 @@ def extract_subs(path, streams, idiomas_sel):
             detalles = ', '.join(f"{i}:{l}" for i, l, _ in lst)
             ui_print(f"  - {shorten_name(f)}: {detalles}")
 
+    if extracted_paths:
+        ui_section("Detalle Subtitulos Extraidos")
+        _print_extracted_summary(path, extracted_paths)
+
+    return extracted_paths
+
 
 def seleccionar_modo():
     ui_title("Modo de trabajo", "Selecciona que quieres hacer")
@@ -291,11 +486,243 @@ def seleccionar_modo():
 
 def seleccionar_idiomas(idiomas):
     ui_title("Idiomas encontrados")
+    # `idiomas` is already sorted; show counts if available via global hint.
     for i, lang in enumerate(idiomas, 1):
-        ui_print(f" {i}. {lang}", style="cyan" if RICH_AVAILABLE else None)
-    sel = input("Elige los numeros de los idiomas a extraer (ej. 1,3): ")
+        hint = LANGUAGE_COUNT_HINT.get(lang)
+        if hint is not None:
+            ui_print(f" {i}. {lang} ({hint} pista(s))", style="cyan" if RICH_AVAILABLE else None)
+        else:
+            ui_print(f" {i}. {lang}", style="cyan" if RICH_AVAILABLE else None)
+    ui_print(" Tip: escribe 'all' para seleccionar todos.", style="dim" if RICH_AVAILABLE else None)
+    sel = input("Elige los numeros de los idiomas a extraer (ej. 1,3) o 'all': ").strip().lower()
+    if sel in {"all", "*"}:
+        return list(idiomas)
     nums = [int(x.strip()) for x in sel.split(',') if x.strip().isdigit()]
     return [idiomas[i - 1] for i in nums if 0 < i <= len(idiomas)]
+
+
+def _safe_read_lines(path: str) -> Iterable[str]:
+    # Some subs have weird encodings; be permissive.
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            yield line
+
+
+def _count_ass_dialogue_lines(path: str) -> int:
+    count = 0
+    for line in _safe_read_lines(path):
+        if line.startswith("Dialogue:"):
+            count += 1
+    return count
+
+
+def _count_srt_entries(path: str) -> int:
+    # Counting timestamp lines is fast and robust.
+    count = 0
+    for line in _safe_read_lines(path):
+        if "-->" in line:
+            count += 1
+    return count
+
+
+def _subtitle_file_metrics(path: str) -> Tuple[int, int]:
+    """Return (entries/dialogue, bytes)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    if ext == ".ass":
+        return _count_ass_dialogue_lines(path), size
+    if ext == ".srt":
+        return _count_srt_entries(path), size
+    return 0, size
+
+
+def _extract_file_lang_and_base(file_name: str) -> Tuple[str, str]:
+    """Return (lang, base_stem) for extracted subtitle files."""
+    m = SUB_FILE_RE.match(file_name)
+    if m:
+        return (m.group("lang"), m.group("base"))
+    stem = os.path.splitext(file_name)[0]
+    return ("und", stem)
+
+
+def _iter_ass_entries(path: str) -> Iterable[str]:
+    # ASS has one subtitle "entry" per Dialogue: line, where the payload is the last CSV field.
+    for line in _safe_read_lines(path):
+        if not ASS_DIALOGUE_RE.match(line):
+            continue
+        parts = line.split(",", 9)
+        if len(parts) < 10:
+            continue
+        text = parts[9].rstrip("\r\n")
+        text = ASS_TAG_STRIP_RE.sub("", text)
+        text = text.replace("\\N", " ").replace("\\n", " ").replace("\\h", " ")
+        yield text.strip()
+
+
+def _iter_srt_entries(path: str) -> Iterable[str]:
+    buf: List[str] = []
+    in_payload = False
+    for raw in _safe_read_lines(path):
+        line = raw.rstrip("\r\n")
+        if not line.strip():
+            if buf:
+                text = " ".join(s.strip() for s in buf if s.strip()).strip()
+                if text:
+                    yield text
+                buf = []
+            in_payload = False
+            continue
+        if "-->" in line:
+            in_payload = True
+            continue
+        if not in_payload:
+            # Skip numeric counter lines.
+            continue
+        buf.append(line)
+    if buf:
+        text = " ".join(s.strip() for s in buf if s.strip()).strip()
+        if text:
+            yield text
+
+
+def _subtitle_content_metrics(path: str) -> dict:
+    """Cheap heuristics to avoid SDH/full subs when a cleaner track exists."""
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    if ext == ".ass":
+        entries_iter = _iter_ass_entries(path)
+    else:
+        entries_iter = _iter_srt_entries(path)
+
+    entries = 0
+    sdh_like = 0
+    music_like = 0
+    empty = 0
+
+    for text in entries_iter:
+        entries += 1
+        t = (text or "").strip()
+        if not t:
+            empty += 1
+            continue
+        if "♪" in t or "♫" in t:
+            music_like += 1
+        tl = t.lower()
+        # Typical SDH cues are bracketed and contain SFX keywords: [door opens], (laughs), etc.
+        if BRACKETED_RE.match(t) and SDH_CUE_RE.search(tl):
+            sdh_like += 1
+        elif SDH_CUE_RE.search(tl) and len(tl) <= 40:
+            # Some tracks use plain "SFX:" lines without brackets.
+            sdh_like += 1
+
+    dialogue = max(0, entries - sdh_like - music_like - empty)
+
+    # Strongly avoid "signs/forced only" tracks unless it's the only option.
+    tiny_penalty = 1000 if entries > 0 and entries < 40 else 0
+
+    score = (dialogue * 1.0) - (sdh_like * 1.5) - (music_like * 1.5) - tiny_penalty
+
+    return {
+        "entries": entries,
+        "dialogue": dialogue,
+        "sdh_like": sdh_like,
+        "music_like": music_like,
+        "empty": empty,
+        "score": score,
+        "bytes": os.path.getsize(path) if os.path.isfile(path) else 0,
+    }
+
+
+def _ensure_discard_dir(folder: str) -> str:
+    d = os.path.join(folder, DISCARD_DIR_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _move_to_discard(folder: str, file_path: str) -> str:
+    discard_dir = _ensure_discard_dir(folder)
+    name = os.path.basename(file_path)
+    dest = os.path.join(discard_dir, name)
+    if os.path.abspath(file_path) == os.path.abspath(dest):
+        return dest
+    if os.path.exists(dest):
+        base, ext = os.path.splitext(name)
+        i = 1
+        while True:
+            alt = os.path.join(discard_dir, f"{base}__dup{i}{ext}")
+            if not os.path.exists(alt):
+                dest = alt
+                break
+            i += 1
+    os.replace(file_path, dest)
+    return dest
+
+
+def auto_select_best_subs(folder: str, extracted_paths: List[str], auto: bool) -> None:
+    """When multiple extracted subtitle files share the same (base, lang), keep the best and discard the rest."""
+    groups = defaultdict(list)
+    for p in extracted_paths:
+        if not os.path.isfile(p):
+            continue
+        name = os.path.basename(p)
+        lang, base = _extract_file_lang_and_base(name)
+        groups[(base, lang)].append(p)
+
+    dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    if not dup_groups:
+        return
+
+    if not auto:
+        if not ask_yes_no(
+            "Detecte subtitulos duplicados por idioma. Conservar solo el mejor y mover el resto a respaldo?",
+            default=True,
+        ):
+            ui_status("info", "Se omitio la seleccion automatica de subtitulos duplicados.")
+            return
+
+    ui_section("Auto Seleccion Subtitulos")
+    ui_status("run", f"Analizando {sum(len(v) for v in dup_groups.values())} archivo(s) en {len(dup_groups)} grupo(s)...")
+
+    kept = 0
+    moved = 0
+    for (base, lang), paths in sorted(dup_groups.items()):
+        metrics = [(p, _subtitle_content_metrics(p)) for p in paths]
+        # Pick the best by score, then by dialogue count, then by entries.
+        metrics.sort(key=lambda x: (x[1]["score"], x[1]["dialogue"], x[1]["entries"], x[1]["bytes"]), reverse=True)
+        best_path, best_m = metrics[0]
+        ui_print(f"- {shorten_name(base)} | {lang}: conservar -> {shorten_name(os.path.basename(best_path))}", style="bold cyan" if RICH_AVAILABLE else None)
+        ui_print(f"    score={best_m['score']:.1f} entries={best_m['entries']} dialogue={best_m['dialogue']} sdh={best_m['sdh_like']} music={best_m['music_like']} bytes={best_m['bytes']}")
+        kept += 1
+
+        for p, m in metrics[1:]:
+            dest = _move_to_discard(folder, p)
+            moved += 1
+            ui_print(
+                f"    mover -> {shorten_name(os.path.basename(dest))} | score={m['score']:.1f} entries={m['entries']} dialogue={m['dialogue']} sdh={m['sdh_like']} music={m['music_like']} bytes={m['bytes']}",
+            )
+
+    ui_status("ok", f"Seleccion completada. grupos={kept}, movidos={moved}. Respaldo: {os.path.join(folder, DISCARD_DIR_NAME)}")
+
+
+def _print_extracted_summary(folder: str, extracted_paths: List[str]) -> None:
+    groups = defaultdict(list)
+    for p in extracted_paths:
+        name = os.path.basename(p)
+        lang, base = _extract_file_lang_and_base(name)
+        groups[(base, lang)].append(p)
+
+    # Stable-ish order.
+    for (base, lang) in sorted(groups.keys()):
+        items = groups[(base, lang)]
+        ui_print(f"- {shorten_name(base)} | {lang} -> {len(items)} archivo(s)", style="bold cyan" if RICH_AVAILABLE else None)
+        # Show the details so user can see duplicates (size/lines differ).
+        for p in sorted(items):
+            entries, size = _subtitle_file_metrics(p)
+            ui_print(f"    {shorten_name(os.path.basename(p))} | {size} bytes | entradas/lineas: {entries}")
 
 
 def es_video_generado(file_name):
@@ -870,6 +1297,27 @@ def main():
         description="Gestiona extraccion y mux de subtitulos en SUBS_BULK."
     )
     parser.add_argument(
+        "--bulk-dir",
+        default=None,
+        help="Carpeta de trabajo (default: ./SUBS_BULK junto al script)",
+    )
+    parser.add_argument(
+        "--scan-workers",
+        type=int,
+        default=6,
+        help="Hilos para escaneo con ffprobe (default: 6)",
+    )
+    parser.add_argument(
+        "--no-scan-cache",
+        action="store_true",
+        help="Desactiva cache del escaneo (ffprobe)",
+    )
+    parser.add_argument(
+        "--no-auto-select-subs",
+        action="store_true",
+        help="Desactiva la seleccion automatica de duplicados tras la extraccion",
+    )
+    parser.add_argument(
         '--si',
         action='store_true',
         help=(
@@ -880,23 +1328,33 @@ def main():
     args = parser.parse_args()
 
     base_dir = os.path.abspath(os.path.dirname(__file__))
-    bulk_dir = os.path.join(base_dir, 'SUBS_BULK')
+    bulk_dir = args.bulk_dir or os.path.join(base_dir, 'SUBS_BULK')
     os.makedirs(bulk_dir, exist_ok=True)
 
     ui_title("Gestor de Subtitulos", f"Carpeta de trabajo: {bulk_dir}")
     modo = seleccionar_modo()
 
     if modo in {1, 3}:
-        idiomas, streams = scan_directory(bulk_dir)
+        idiomas, streams = scan_directory(
+            bulk_dir,
+            workers=args.scan_workers,
+            use_cache=not args.no_scan_cache,
+        )
+
+        global LANGUAGE_COUNT_HINT
+        LANGUAGE_COUNT_HINT = {lang: len(items) for lang, items in _summarize_streams_by_language(streams).items()}
         if not streams:
             ui_status('info', "No se detectaron pistas de subtitulos en videos dentro de SUBS_BULK.")
         else:
+            _print_duplicate_streams(streams)
             idiomas_seleccionados = seleccionar_idiomas(idiomas)
             if not idiomas_seleccionados:
                 ui_status('info', "No se selecciono ningun idioma para extraer.")
             else:
                 ui_status('run', f"Iniciando extraccion para: {', '.join(idiomas_seleccionados)}")
-                extract_subs(bulk_dir, streams, idiomas_seleccionados)
+                extracted_paths = extract_subs(bulk_dir, streams, idiomas_seleccionados)
+                if extracted_paths and not args.no_auto_select_subs:
+                    auto_select_best_subs(bulk_dir, extracted_paths, auto=args.si)
 
     muxed_sub_paths = []
     if modo in {2, 3}:
