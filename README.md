@@ -17,7 +17,7 @@ Herramientas para trabajar subtitulos locales:
 - Ollama instalado y activo (para traduccion).
 - Un modelo instalado en Ollama (ejemplo: `gemma3:4b`).
 - `ffmpeg` y `ffprobe` en PATH (para extraccion).
-- Recomendado: MKVToolNix (`mkvmerge`) para mux de MKV mas robusto.
+- Recomendado: MKVToolNix (`mkvmerge`/`mkvextract`) para escaneo/extraccion/mux mas rapido y robusto en MKV.
 - Opcional: `rich` para barras de progreso mas claras.
 
 ## Instalacion rapida
@@ -87,6 +87,8 @@ El script:
 - Detecta pistas de subtitulo disponibles por idioma.
 - Permite extraer, muxear o hacer ambas cosas.
 - Conserva formato (`ass`/`srt`) o convierte a `srt` cuando aplica.
+- En `.mkv`, si MKVToolNix esta disponible, usa `mkvmerge -J` para escaneo y `mkvextract` para extraer (mas rapido).
+- Omite automaticamente subtitulos basados en imagen (PGS/VobSub/DVB) porque requieren OCR.
 - Al muxear, agrega metadatos de idioma/titulo a subtitulos externos.
 - Si hay subtitulo en espanol, lo marca como `default`.
 - Si `mkvmerge` esta disponible, lo usa automaticamente para mux de `.mkv`.

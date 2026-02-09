@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GESTIONAR_subs_v1.py
-Version 3.2 - 06-feb-2026
+Version 3.3 - 09-feb-2026
 
 - Usa SUBS_BULK como carpeta de trabajo para videos y subtitulos.
 - Extrae subtitulos de los videos detectados.
@@ -18,6 +18,11 @@ Mejoras 3.1:
 Mejoras 3.2:
 - Seleccion automatica de la mejor pista/archivo cuando hay duplicados del mismo idioma.
   (Evita subs tipo SDH/full con canciones/SFX cuando existe una alternativa mas limpia.)
+
+Mejoras 3.3:
+- Escaneo de MKV via mkvmerge (rapido) cuando MKVToolNix esta disponible.
+- Extraccion por video en lote (una invocacion por archivo) via mkvextract/ffmpeg.
+- Omitir automaticamente subtitulos basados en imagen (PGS/VobSub/DVB) que requieren OCR.
 """
 
 import json
@@ -196,8 +201,23 @@ def find_mkvmerge_exe():
     return None
 
 
-def _run(cmd):
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def find_mkvextract_exe():
+    exe = shutil.which('mkvextract')
+    if exe:
+        return exe
+
+    candidates = [
+        r'C:\Program Files\MKVToolNix\mkvextract.exe',
+        r'C:\Program Files (x86)\MKVToolNix\mkvextract.exe',
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _run(cmd, *, cwd: Optional[str] = None):
+    result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return (
         result.returncode,
         result.stdout.decode(errors='replace'),
@@ -265,7 +285,7 @@ def _load_scan_cache(folder: str) -> Dict[str, dict]:
 def _save_scan_cache(folder: str, videos_cache: Dict[str, dict]) -> None:
     cache_path = _scan_cache_path(folder)
     tmp_path = cache_path + ".tmp"
-    payload = {"version": 1, "videos": videos_cache}
+    payload = {"version": 2, "videos": videos_cache}
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
@@ -287,11 +307,16 @@ def _video_key(folder: str, file_name: str) -> Optional[VideoKey]:
     return VideoKey(name=file_name, size=int(st.st_size), mtime_ns=int(st.st_mtime_ns))
 
 
-def _ffprobe_subtitle_streams(folder: str, file_name: str) -> Tuple[List[Tuple[str, int, str, str]], List[str]]:
+def _ffprobe_subtitle_streams(folder: str, file_name: str) -> Tuple[List[Tuple[str, int, str, str, str]], List[str]]:
     """Return (streams, langs) for one video file."""
     idiomas, streams = set(), []
     code, out, err = _run([
         'ffprobe', '-v', 'error',
+        # Make scanning much faster on big files; subtitle track listing should be in headers/metadata.
+        # If a weird file fails to expose tracks with these settings, user can disable cache and retry;
+        # we keep a conservative probesize but avoid long analyze passes.
+        '-analyzeduration', '0',
+        '-probesize', '256k',
         '-select_streams', 's',
         '-show_entries', FFPROBE_FIELDS,
         '-of', 'json', os.path.join(folder, file_name)
@@ -309,7 +334,7 @@ def _ffprobe_subtitle_streams(folder: str, file_name: str) -> Tuple[List[Tuple[s
             codec = s.get('codec_name', 'unknown')
             lang = (s.get('tags', {}) or {}).get('language', 'und')
             idiomas.add(lang)
-            streams.append((file_name, idx, lang, codec))
+            streams.append((file_name, int(idx), lang, codec, 'ffprobe'))
     except json.JSONDecodeError:
         ui_status('warn', f"No se pudo leer la salida de ffprobe para '{shorten_name(file_name)}'.")
         return [], []
@@ -317,17 +342,72 @@ def _ffprobe_subtitle_streams(folder: str, file_name: str) -> Tuple[List[Tuple[s
     return streams, sorted(idiomas)
 
 
-def _summarize_streams_by_language(streams: List[Tuple[str, int, str, str]]):
+def _codec_from_mkvmerge_track(track: dict) -> str:
+    # mkvmerge JSON varies slightly by version. Prefer codec_id (Matroska codec id).
+    codec_id = str((track.get("properties") or {}).get("codec_id") or "")
+    codec = str(track.get("codec") or "")
+    raw = (codec_id or codec).upper()
+
+    # Common text subtitle codecs in Matroska.
+    if "S_TEXT/ASS" in raw or "S_TEXT/SSA" in raw or "ASS" in raw or "SSA" in raw:
+        return "ass"
+    if "S_TEXT/UTF8" in raw or "SUBRIP" in raw or "SRT" in raw:
+        return "subrip"
+
+    # Image-based / other subs we don't translate directly.
+    if "S_HDMV/PGS" in raw or "PGS" in raw:
+        return "pgs"
+    if "S_VOBSUB" in raw or "VOBSUB" in raw:
+        return "vobsub"
+    if "S_DVBSUB" in raw or "DVBSUB" in raw:
+        return "dvbsub"
+
+    return (codec_id or codec or "unknown").lower()
+
+
+def _mkvmerge_subtitle_streams(mkvmerge_exe: str, folder: str, file_name: str) -> Tuple[List[Tuple[str, int, str, str, str]], List[str]]:
+    """Return (streams, langs) for one MKV file using mkvmerge -J (fast)."""
+    idiomas, streams = set(), []
+    code, out, err = _run([mkvmerge_exe, '-J', os.path.join(folder, file_name)])
+    if code != 0:
+        ui_status('warn', f"mkvmerge fallo en '{shorten_name(file_name)}': {err.strip()}")
+        return [], []
+
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        ui_status('warn', f"No se pudo leer la salida de mkvmerge para '{shorten_name(file_name)}'.")
+        return [], []
+
+    tracks = data.get("tracks", []) if isinstance(data, dict) else []
+    for t in tracks:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") != "subtitles":
+            continue
+        tid = t.get("id")
+        if tid is None:
+            continue
+        props = t.get("properties") or {}
+        lang = str(props.get("language") or "und")
+        codec = _codec_from_mkvmerge_track(t)
+        idiomas.add(lang)
+        streams.append((file_name, int(tid), lang, codec, 'mkvmerge'))
+
+    return streams, sorted(idiomas)
+
+
+def _summarize_streams_by_language(streams: List[Tuple[str, int, str, str, str]]):
     by_lang = defaultdict(list)
-    for file_name, idx, lang, codec in streams:
+    for file_name, idx, lang, codec, _tool in streams:
         by_lang[lang].append((file_name, idx, codec))
     return by_lang
 
 
-def _print_duplicate_streams(streams: List[Tuple[str, int, str, str]]) -> None:
+def _print_duplicate_streams(streams: List[Tuple[str, int, str, str, str]]) -> None:
     """Show per-video languages that have multiple subtitle streams."""
     by_video = defaultdict(list)
-    for video_name, idx, lang, codec in streams:
+    for video_name, idx, lang, codec, _tool in streams:
         by_video[video_name].append((lang, idx, codec))
 
     duplicates = []
@@ -356,12 +436,16 @@ def scan_directory(path, *, workers=6, use_cache=True):
     """Scan subtitle streams inside videos in `path`.
 
     Returns (idiomas, streams).
-    streams -> list[(video_file, ffprobe_stream_index, lang, codec)]
+    streams -> list[(video_file, index, lang, codec, tool)]
+      tool: 'mkvmerge' (for MKV using mkvmerge IDs) or 'ffprobe' (for ffprobe stream indices)
     """
     idiomas, streams = set(), []
     videos = list_video_files(path)
     if not videos:
         return [], []
+
+    mkvmerge_exe = find_mkvmerge_exe()
+    mkvextract_exe = find_mkvextract_exe()
 
     videos_cache = _load_scan_cache(path) if use_cache else {}
     cache_changed = False
@@ -372,11 +456,27 @@ def scan_directory(path, *, workers=6, use_cache=True):
         if key is None:
             continue
         cached = videos_cache.get(f)
+        ext = os.path.splitext(f)[1].lower()
+        # If MKVToolNix is available, prefer mkvmerge for MKV even if cache exists from ffprobe runs,
+        # so we can later use mkvextract (and it's usually faster to scan too).
+        require_mkvtoolnix = (ext == '.mkv' and bool(mkvmerge_exe) and bool(mkvextract_exe))
         if cached and cached.get("size") == key.size and cached.get("mtime_ns") == key.mtime_ns:
             cached_streams = cached.get("streams") or []
+            # If cache doesn't carry mkvmerge ids, refresh it when we can.
+            if require_mkvtoolnix and any((item.get("tool") or "ffprobe") != "mkvmerge" for item in cached_streams):
+                to_probe.append((key, f))
+                continue
+
             for item in cached_streams:
                 try:
-                    streams.append((f, int(item["index"]), str(item.get("lang") or "und"), str(item.get("codec") or "unknown")))
+                    tool = str(item.get("tool") or "ffprobe")
+                    streams.append((
+                        f,
+                        int(item["index"]),
+                        str(item.get("lang") or "und"),
+                        str(item.get("codec") or "unknown"),
+                        tool,
+                    ))
                     idiomas.add(str(item.get("lang") or "und"))
                 except Exception:
                     # If cache is malformed, just re-probe this file.
@@ -386,80 +486,205 @@ def scan_directory(path, *, workers=6, use_cache=True):
             to_probe.append((key, f))
 
     if to_probe:
-        ui_status("run", f"Escaneando pistas de subtitulos (ffprobe) en {len(to_probe)}/{len(videos)} videos...")
+        ui_status("run", f"Escaneando pistas de subtitulos en {len(to_probe)}/{len(videos)} videos...")
 
         max_workers = max(1, int(workers or 1))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = {ex.submit(_ffprobe_subtitle_streams, path, f): (key, f) for key, f in to_probe}
+            def _scan_one(folder: str, file_name: str):
+                ext = os.path.splitext(file_name)[1].lower()
+                if ext == '.mkv' and mkvmerge_exe and mkvextract_exe:
+                    return _mkvmerge_subtitle_streams(mkvmerge_exe, folder, file_name)
+                return _ffprobe_subtitle_streams(folder, file_name)
+
+            futs = {ex.submit(_scan_one, path, f): (key, f) for key, f in to_probe}
             for fut in as_completed(futs):
                 key, f = futs[fut]
                 try:
                     s, langs = fut.result()
                 except Exception as exc:
-                    ui_status("warn", f"ffprobe fallo en '{shorten_name(f)}': {exc}")
+                    ui_status("warn", f"Escaneo fallo en '{shorten_name(f)}': {exc}")
                     continue
 
-                for file_name, idx, lang, codec in s:
-                    streams.append((file_name, idx, lang, codec))
+                for entry in s:
+                    file_name, idx, lang, codec, tool = entry
+                    streams.append((file_name, int(idx), lang, codec, tool))
                     idiomas.add(lang)
 
                 if use_cache:
                     videos_cache[f] = {
                         "size": key.size,
                         "mtime_ns": key.mtime_ns,
-                        "streams": [{"index": idx, "lang": lang, "codec": codec} for _, idx, lang, codec in s],
+                        "streams": [
+                            {"index": idx, "lang": lang, "codec": codec, "tool": tool}
+                            for _fn, idx, lang, codec, tool in s
+                        ],
                     }
                     cache_changed = True
 
     if use_cache and cache_changed:
         _save_scan_cache(path, videos_cache)
 
+    # Normalize streams ordering for stable UI (then extraction groups by video anyway).
+    streams.sort(key=lambda x: (x[0].lower(), int(x[1]), str(x[2]).lower(), str(x[3]).lower(), str(x[4]).lower()))
     return sorted(idiomas), streams
+
+
+def _is_image_subtitle_codec(codec: str) -> bool:
+    c = (codec or "").strip().lower()
+    return c in {
+        "hdmv_pgs_subtitle",
+        "pgs",
+        "vobsub",
+        "dvd_subtitle",
+        "dvb_subtitle",
+        "dvbsub",
+        "xsub",
+    }
+
+
+def _pick_output_for_codec(codec: str) -> Tuple[str, str]:
+    c = (codec or "").strip().lower()
+    if c == 'ass':
+        return '.ass', 'copy'
+    if c in {'srt', 'subrip'}:
+        return '.srt', 'copy'
+    # For other text subtitle formats (e.g. mov_text), attempt to convert to SRT via ffmpeg.
+    return '.srt', 'srt'
 
 
 def extract_subs(path, streams, idiomas_sel):
     ok, fail = 0, 0
+    skipped = 0
     errores = defaultdict(list)
     extracted_paths = []
 
-    for file_name, idx, lang, codec in streams:
-        if lang not in idiomas_sel:
+    mkvextract_exe = find_mkvextract_exe()
+
+    # Group by video so we can extract multiple tracks with ONE tool invocation per file.
+    by_video = defaultdict(list)
+    for file_name, idx, lang, codec, tool in streams:
+        if lang in idiomas_sel:
+            by_video[file_name].append((int(idx), str(lang), str(codec), str(tool)))
+
+    for file_name, items in sorted(by_video.items(), key=lambda x: x[0].lower()):
+        video_path = os.path.join(path, file_name)
+        base = os.path.splitext(file_name)[0]
+        ext_video = os.path.splitext(file_name)[1].lower()
+
+        # Prefer MKVToolNix extraction for MKV when we have mkvmerge IDs (tool='mkvmerge').
+        can_use_mkvextract = (
+            ext_video == '.mkv'
+            and mkvextract_exe
+            and items
+            and all(t == 'mkvmerge' for _idx, _lang, _codec, t in items)
+        )
+
+        expected = []  # list[(out_path, idx, lang, codec, impl)]
+        if can_use_mkvextract:
+            # mkvextract cannot "convert"; we only extract text tracks we can translate.
+            track_specs = []
+            for idx, lang, codec, _tool in sorted(items, key=lambda x: int(x[0])):
+                if _is_image_subtitle_codec(codec):
+                    skipped += 1
+                    ui_status('warn', f"Omitido {lang} | {str(codec).upper()} (imagen/OCR) en '{shorten_name(file_name)}'")
+                    continue
+                ext, _codec_opt = _pick_output_for_codec(codec)
+                if _codec_opt != 'copy':
+                    # mkvextract only copies the track as-is; fall back to ffmpeg for conversion codecs.
+                    # This mainly matters for non-MKV containers, but keep it safe.
+                    skipped += 1
+                    ui_status('warn', f"Omitido {lang} | {str(codec).upper()} (no extraible directo con mkvextract) en '{shorten_name(file_name)}'")
+                    continue
+                out_file = f"{base}_{lang}_sub{idx}{ext}"
+                out_path = os.path.join(path, out_file)
+                # Use cwd=SUBS_BULK and relative outputs to avoid ambiguity with drive letter colons on Windows.
+                track_specs.append(f"{idx}:{out_file}")
+                expected.append((out_path, idx, lang, codec, 'mkvextract'))
+
+            if track_specs:
+                code, _out, err = _run([mkvextract_exe, 'tracks', file_name, *track_specs], cwd=path)
+                if code != 0:
+                    # Mark all expected as failed; mkvextract returns a single code for the batch.
+                    for out_path, idx, lang, codec, _impl in expected:
+                        fail += 1
+                        errores[file_name].append((idx, lang, codec))
+                        ui_status(
+                            'err',
+                            (
+                                f"Error al extraer {lang} | {str(codec).upper()} de "
+                                f"'{shorten_name(file_name)}'. mkvextract: {_last_error_line(err)}"
+                            ),
+                        )
+                else:
+                    for out_path, idx, lang, codec, _impl in expected:
+                        if os.path.isfile(out_path):
+                            ok += 1
+                            extracted_paths.append(out_path)
+                            ui_status('ok', f"Extraido {lang} | {str(codec).upper():<7} -> {shorten_name(os.path.basename(out_path))}")
+                        else:
+                            fail += 1
+                            errores[file_name].append((idx, lang, codec))
+                            ui_status(
+                                'err',
+                                (
+                                    f"Error al extraer {lang} | {str(codec).upper()} de "
+                                    f"'{shorten_name(file_name)}'. Detalle: salida no creada."
+                                ),
+                            )
             continue
 
-        base = os.path.splitext(file_name)[0]
+        # Fallback: ffmpeg. Build ONE command for the whole file (multiple outputs).
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', video_path]
+        for idx, lang, codec, _tool in sorted(items, key=lambda x: int(x[0])):
+            if _is_image_subtitle_codec(codec):
+                skipped += 1
+                ui_status('warn', f"Omitido {lang} | {str(codec).upper()} (imagen/OCR) en '{shorten_name(file_name)}'")
+                continue
+            ext, codec_opt = _pick_output_for_codec(codec)
+            out_file = f"{base}_{lang}_sub{idx}{ext}"
+            out_path = os.path.join(path, out_file)
+            expected.append((out_path, idx, lang, codec, 'ffmpeg'))
+            cmd.extend(['-map', f'0:{idx}', '-c:s', codec_opt, out_path])
 
-        if codec == 'ass':
-            ext, codec_opt = '.ass', 'copy'
-        elif codec in {'srt', 'subrip'}:
-            ext, codec_opt = '.srt', 'copy'
-        else:
-            ext, codec_opt = '.srt', 'srt'
+        if not expected:
+            continue
 
-        out_file = f"{base}_{lang}_sub{idx}{ext}"
-        out_path = os.path.join(path, out_file)
+        code, _out, err = _run(cmd)
+        if code != 0:
+            # ffmpeg batches; if it fails, report per track with the shared last error line.
+            err_line = _last_error_line(err)
+            for out_path, idx, lang, codec, _impl in expected:
+                fail += 1
+                errores[file_name].append((idx, lang, codec))
+                ui_status(
+                    'err',
+                    (
+                        f"Error al extraer {lang} | {str(codec).upper()} de "
+                        f"'{shorten_name(file_name)}'. ffmpeg: {err_line}"
+                    ),
+                )
+            continue
 
-        code, _, err = _run([
-            'ffmpeg', '-y', '-i', os.path.join(path, file_name),
-            '-map', f'0:{idx}', '-c:s', codec_opt, out_path
-        ])
-
-        if code == 0 and os.path.isfile(out_path):
-            ok += 1
-            extracted_paths.append(out_path)
-            ui_status('ok', f"Extraido {lang} | {codec.upper():<7} -> {shorten_name(out_file)}")
-        else:
-            fail += 1
-            errores[file_name].append((idx, lang, codec))
-            ui_status(
-                'err',
-                (
-                    f"Error al extraer {lang} | {codec.upper()} de "
-                    f"'{shorten_name(file_name)}'. ffmpeg: {_last_error_line(err)}"
-                ),
-            )
+        for out_path, idx, lang, codec, _impl in expected:
+            if os.path.isfile(out_path):
+                ok += 1
+                extracted_paths.append(out_path)
+                ui_status('ok', f"Extraido {lang} | {str(codec).upper():<7} -> {shorten_name(os.path.basename(out_path))}")
+            else:
+                fail += 1
+                errores[file_name].append((idx, lang, codec))
+                ui_status(
+                    'err',
+                    (
+                        f"Error al extraer {lang} | {str(codec).upper()} de "
+                        f"'{shorten_name(file_name)}'. Detalle: salida no creada."
+                    ),
+                )
 
     ui_section("Resumen Extraccion")
     ui_print(f"Subtitulos extraidos correctamente: {ok}", style="bold green" if RICH_AVAILABLE else None)
+    if skipped:
+        ui_print(f"Subtitulos omitidos (imagen/OCR): {skipped}", style="bold yellow" if RICH_AVAILABLE else None)
     if fail:
         ui_print(f"Subtitulos con error: {fail}", style="bold red" if RICH_AVAILABLE else None)
         for f, lst in errores.items():
@@ -1305,12 +1530,12 @@ def main():
         "--scan-workers",
         type=int,
         default=6,
-        help="Hilos para escaneo con ffprobe (default: 6)",
+        help="Hilos para escaneo (ffprobe/mkvmerge) (default: 6)",
     )
     parser.add_argument(
         "--no-scan-cache",
         action="store_true",
-        help="Desactiva cache del escaneo (ffprobe)",
+        help="Desactiva cache del escaneo",
     )
     parser.add_argument(
         "--no-auto-select-subs",
