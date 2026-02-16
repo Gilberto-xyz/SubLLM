@@ -56,12 +56,46 @@ Opciones utiles:
 
 - `--out`: ruta de salida.
 - `--batch`: traduce en lote todos los `.ass/.srt` de `SUBS_BULK/`.
+- `--parallel-files N`: cantidad de archivos en paralelo en `--batch` o multi-seleccion (usa subprocesos).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad.
 - `--limit N`: traduce solo los primeros N bloques.
 - `--fast`: aplica perfil rapido.
+- `--one-shot`: intenta traducir en un lote grande cuando el contexto lo permite.
+- `--bench`: imprime metricas detalladas de rendimiento por llamada.
+
+## Rendimiento y reintentos (actualizado)
+
+El flujo de traduccion fue optimizado para reducir llamadas extra al modelo y mejorar estabilidad en equipos con recursos limitados:
+
+- Mejor manejo de respuestas JSON parciales para evitar reintentos costosos.
+- Control de profundidad de split de lotes para evitar explosiones de llamadas.
+- Presupuesto de reintentos en modo rapido (`--fast`) para priorizar velocidad.
+- Resumen de metricas por archivo tambien en modo paralelo (`--parallel-files > 1`).
+
+En el resumen final veras, entre otros:
+
+- `Retry counters`: reintentos por tipo.
+- `Fast retry budget`: items recortados por presupuesto en `--fast`.
+- `Split stats`: recursiones/cortes de split.
+- `Top flagged reasons`: razones mas comunes de lineas marcadas.
+- `Ollama calls`: numero total de llamadas al modelo.
+
+## Recomendacion para GPU limitada
+
+Si Ollama usa una sola GPU con memoria limitada:
+
+- Usa `--fast --one-shot`.
+- Prueba `--parallel-files 2` como punto de equilibrio.
+- Evita `--parallel-files 3` o mas, suele empeorar por contencion.
+
+Ejemplo de lote recomendado:
+
+```bash
+python translate_subs.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish --fast --one-shot --parallel-files 2
+```
 
 Salida por defecto:
 

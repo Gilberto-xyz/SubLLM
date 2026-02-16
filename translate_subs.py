@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import fnmatch
 import json
@@ -73,7 +74,7 @@ SINGLE_TRANSLATION_CACHE = {}
 REPAIR_BATCH_MAX = 8
 MAX_REPAIR_FALLBACK_LINES = 3
 ASS_MAX_BATCH_ITEMS = 32
-ONE_SHOT_MAX_BATCH_ITEMS = 64
+ONE_SHOT_MAX_BATCH_ITEMS = 512
 DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
@@ -81,6 +82,8 @@ DEFAULT_OUT_FRACTION = 0.60    # si num_predict no viene definido, reservar ~60%
 TRANSLATION_SUMMARY_MAX = 600
 TRANSLATION_TONE_MAX = 400
 ROLLING_CONTEXT_MAX_CHARS = 600
+FAST_SPLIT_MAX_DEPTH = 1
+FAST_REPAIR_RATIO = 0.04
 T = TypeVar("T")
 FORMAT_MODE = "auto"
 MINIFY_JSON_PROMPTS = True
@@ -233,6 +236,14 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
             ),
             "cyan",
         )
+    fast_trunc_batches = RUNTIME_METRICS.counters.get("retry.fast_budget.truncated_batches", 0)
+    if fast_trunc_batches:
+        fast_trunc_items = RUNTIME_METRICS.counters.get("retry.fast_budget.truncated_items", 0)
+        cprint(
+            console,
+            f"Fast retry budget: truncated_batches={fast_trunc_batches}, skipped_items={fast_trunc_items}",
+            "cyan",
+        )
     batch_calls = RUNTIME_METRICS.counters.get("translate.json_batch.calls", 0)
     top_batches = RUNTIME_METRICS.counters.get("translate.top_level_batches", 0)
     if top_batches:
@@ -255,6 +266,23 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
     schema_retries = RUNTIME_METRICS.counters.get("format.schema_retry.attempts", 0)
     if schema_retries:
         cprint(console, f"Format fallbacks: schema_retry={schema_retries}", "cyan")
+    split_recursions = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
+    split_cutoff = RUNTIME_METRICS.counters.get("translate.split.depth_cutoff", 0)
+    if split_recursions or split_cutoff:
+        cprint(
+            console,
+            f"Split stats: recursions={split_recursions}, depth_cutoff={split_cutoff}",
+            "cyan",
+        )
+    reason_entries = [
+        (name[len("status.reason.") :], count)
+        for name, count in RUNTIME_METRICS.counters.items()
+        if name.startswith("status.reason.") and count > 0
+    ]
+    if reason_entries:
+        reason_entries.sort(key=lambda pair: pair[1], reverse=True)
+        top = ", ".join(f"{reason}={count}" for reason, count in reason_entries[:6])
+        cprint(console, f"Top flagged reasons: {top}", "cyan")
     if resolve_format_mode() == "auto":
         cprint(
             console,
@@ -1058,6 +1086,38 @@ def effective_batch_cap(batch_size: int, one_shot: bool) -> int:
     return min(requested, ASS_MAX_BATCH_ITEMS)
 
 
+def needs_llm_repair_for_reasons(status: dict, repair_reasons: set[str]) -> bool:
+    reasons = status.get("reasons") if isinstance(status, dict) else None
+    if not reasons:
+        return False
+    return any(reason in repair_reasons for reason in reasons)
+
+
+def fast_repair_budget(batch_len: int) -> int:
+    return max(2, int(math.ceil(FAST_REPAIR_RATIO * max(1, batch_len))))
+
+
+def trim_failed_items_for_fast_budget(failed_items: List[dict], budget: int) -> List[dict]:
+    if budget <= 0 or len(failed_items) <= budget:
+        return failed_items
+    ranked = sorted(
+        failed_items,
+        key=lambda item: int(item.get("status", {}).get("score", 0)),
+        reverse=True,
+    )
+    RUNTIME_METRICS.bump("retry.fast_budget.truncated_batches")
+    RUNTIME_METRICS.bump("retry.fast_budget.truncated_items", len(failed_items) - budget)
+    return ranked[:budget]
+
+
+def bump_status_reason_counters(status: dict) -> None:
+    reasons = status.get("reasons") if isinstance(status, dict) else None
+    if not reasons:
+        return
+    for reason in reasons:
+        RUNTIME_METRICS.bump(f"status.reason.{reason}")
+
+
 def should_translate(segment: str) -> bool:
     return bool(re.search(r"[A-Za-z]", segment))
 
@@ -1162,6 +1222,47 @@ def parse_array_response(content: str, expected_len: int) -> List[str] | None:
     fallback = extract_json_array(content)
     if fallback is not None and len(fallback) == expected_len:
         return fallback
+    return None
+
+
+def parse_array_response_loose(content: str) -> List[str] | None:
+    cleaned = content.strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            return [str(item) for item in data]
+        if isinstance(data, dict):
+            for key in ("translations", "items", "data", "result", "output"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [str(item) for item in value]
+    except json.JSONDecodeError:
+        pass
+    fallback = extract_json_array(content)
+    if fallback is not None:
+        return fallback
+    cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE).replace("```", "")
+    start = cleaned.find("[")
+    if start != -1:
+        payload = cleaned[start:]
+        decoder = json.JSONDecoder()
+        idx = 1
+        out: List[str] = []
+        while idx < len(payload):
+            while idx < len(payload) and payload[idx] in " \r\n\t,":
+                idx += 1
+            if idx >= len(payload):
+                break
+            if payload[idx] == "]":
+                return out
+            try:
+                value, next_idx = decoder.raw_decode(payload, idx)
+            except json.JSONDecodeError:
+                break
+            out.append(str(value))
+            idx = next_idx
+        if out:
+            return out
     return None
 
 
@@ -1321,6 +1422,7 @@ def translate_json_batch(
     force_temperature_zero: bool = False,
     timing_label: str = "translate.chat.batch_json",
     format_mode: str | None = None,
+    allow_partial: bool = False,
 ) -> List[str] | None:
     global AUTO_JSON_DISABLED, AUTO_JSON_ATTEMPTS, AUTO_JSON_FAILS
     if not texts:
@@ -1374,6 +1476,14 @@ def translate_json_batch(
         if used_auto_json:
             AUTO_JSON_ATTEMPTS += 1
         return parsed
+    if allow_partial:
+        partial = parse_array_response_loose(content)
+        if partial:
+            if BENCH_MODE:
+                print(
+                    f"[bench] partial_parse accepted size={len(partial)} expected={len(texts)}"
+                )
+            return partial
     if used_auto_json:
         AUTO_JSON_ATTEMPTS += 1
         AUTO_JSON_FAILS += 1
@@ -1413,6 +1523,9 @@ def translate_json_batch_with_split(
     force_temperature_zero: bool = False,
     timing_label: str = "translate.chat.batch_json",
     format_mode: str | None = None,
+    allow_partial: bool = False,
+    depth: int = 0,
+    max_split_depth: int | None = None,
 ) -> List[str | None]:
     if not texts:
         return []
@@ -1429,6 +1542,7 @@ def translate_json_batch_with_split(
             force_temperature_zero=force_temperature_zero,
             timing_label=timing_label,
             format_mode=format_mode,
+            allow_partial=allow_partial,
         )
     except OllamaTimeoutError:
         out = None
@@ -1438,10 +1552,21 @@ def translate_json_batch_with_split(
         else:
             out = None
 
-    if out is not None and len(out) == len(texts):
-        return [strip_label_prefix(item) for item in out]
+    if out is not None:
+        cleaned_out = [strip_label_prefix(item) for item in out]
+        if len(cleaned_out) == len(texts):
+            return cleaned_out
+        if allow_partial:
+            if len(cleaned_out) > len(texts):
+                return cleaned_out[: len(texts)]
+            return cleaned_out + [None] * (len(texts) - len(cleaned_out))
     if len(texts) == 1:
         return [None]
+    if max_split_depth is not None and depth >= max_split_depth:
+        RUNTIME_METRICS.bump("translate.split.depth_cutoff")
+        return [None] * len(texts)
+    RUNTIME_METRICS.bump("translate.split.recursions")
+    RUNTIME_METRICS.bump("translate.split.recursion_items", len(texts))
 
     mid = max(1, len(texts) // 2)
     left = translate_json_batch_with_split(
@@ -1456,6 +1581,9 @@ def translate_json_batch_with_split(
         force_temperature_zero=force_temperature_zero,
         timing_label=timing_label,
         format_mode=format_mode,
+        allow_partial=allow_partial,
+        depth=depth + 1,
+        max_split_depth=max_split_depth,
     )
     right = translate_json_batch_with_split(
         client,
@@ -1469,6 +1597,9 @@ def translate_json_batch_with_split(
         force_temperature_zero=force_temperature_zero,
         timing_label=timing_label,
         format_mode=format_mode,
+        allow_partial=allow_partial,
+        depth=depth + 1,
+        max_split_depth=max_split_depth,
     )
     return left + right
 
@@ -2031,13 +2162,20 @@ def run_ass_surgical_fallback(
     target_lang: str,
     options,
     console,
+    fast_mode: bool = False,
+    fast_budget: int | None = None,
 ) -> None:
     if not failed_items:
         return
+    if fast_mode:
+        budget = fast_budget if fast_budget is not None else fast_repair_budget(len(failed_items))
+        failed_items = trim_failed_items_for_fast_budget(failed_items, budget)
+        if not failed_items:
+            return
     RUNTIME_METRICS.bump("retry.ass_surgical.attempts")
     RUNTIME_METRICS.bump("retry.ass_surgical.items", len(failed_items))
     total = len(failed_items)
-    if total <= 6:
+    if total <= 6 and not fast_mode:
         for item in failed_items:
             repaired = translate_ass_slots_single(client, item, summary, tone_guide, target_lang, options)
             if repaired is not None:
@@ -2132,6 +2270,8 @@ def retry_failed_items_batch(
     options,
     mode: str,
     format_mode: str | None = "schema",
+    allow_partial: bool = True,
+    max_split_depth: int | None = None,
 ) -> None:
     """Reintenta en batch (temp=0 + schema) para evitar N llamadas 1x1 cuando el batch salió muy mal."""
     if not failed_items:
@@ -2151,6 +2291,8 @@ def retry_failed_items_batch(
         force_temperature_zero=True,
         timing_label="retry.chat.batch_temp0",
         format_mode=format_mode,
+        allow_partial=allow_partial,
+        max_split_depth=max_split_depth,
     )
     for it, cand in zip(failed_items, out):
         if cand is None:
@@ -2179,6 +2321,7 @@ def translate_srt(
     console,
     one_shot: bool = False,
     rolling_context: int = 0,
+    fast_mode: bool = False,
 ) -> Tuple[str, int]:
     blocks, items = parse_srt_ir(text, limit)
     if not items:
@@ -2189,6 +2332,12 @@ def translate_srt(
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
 
+    repair_reasons = (
+        {"empty_output", "label_prefix", "unchanged"}
+        if fast_mode
+        else {"empty_output", "label_prefix", "line_break_mismatch", "unchanged", "language_leak", "very_suspicious"}
+    )
+    max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
     history: List[str] = []
@@ -2208,14 +2357,23 @@ def translate_srt(
                 options,
                 mode="srt_block",
                 rolling_context=context_hint,
+                allow_partial=fast_mode,
+                max_split_depth=max_split_depth,
             )
             for item, candidate in zip(batch, out):
                 status = scan_srt_candidate(item, candidate or "", target_lang)
                 item["candidate"] = status["candidate"]
                 item["status"] = status
+                bump_status_reason_counters(status)
 
-            failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            failed_items = [
+                item
+                for item in batch
+                if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+            ]
             repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
+            if fast_mode and failed_items:
+                failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
             if failed_items and len(failed_items) > repair_limit:
                 cprint(
                     console,
@@ -2230,9 +2388,17 @@ def translate_srt(
                     target_lang,
                     options,
                     mode="srt_block",
+                    allow_partial=fast_mode,
+                    max_split_depth=max_split_depth,
                 )
-                failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
-            if failed_items:
+                failed_items = [
+                    item
+                    for item in batch
+                    if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                ]
+                if fast_mode and failed_items:
+                    failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
+            if failed_items and not fast_mode:
                 for item in failed_items:
                     repaired = fallback_srt_linewise(
                         client,
@@ -2248,12 +2414,16 @@ def translate_srt(
             for item in batch:
                 if "forced_text" in item:
                     final_text = item["forced_text"]
-                elif item["status"]["ok"]:
+                elif item["status"]["ok"] or not needs_llm_repair_for_reasons(item["status"], repair_reasons):
                     final_text = enforce_line_count(
                         item["status"]["candidate"],
                         item["expected_line_count"],
                     )
                 else:
+                    if fast_mode:
+                        item["final_text"] = item["original_text_field"]
+                        history.append(item["final_text"].replace("\n", " ").strip())
+                        continue
                     retried = retry_single_item_translation(
                         client,
                         item["original_text_field"],
@@ -2305,6 +2475,7 @@ def translate_ass(
     ass_mode: str = "line",
     one_shot: bool = False,
     rolling_context: int = 0,
+    fast_mode: bool = False,
 ) -> Tuple[str, int]:
     if ass_mode == "segment":
         return translate_ass_segment(
@@ -2329,7 +2500,12 @@ def translate_ass(
 
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
-    severe_reasons = {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
+    repair_reasons = (
+        {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
+        if fast_mode
+        else {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
+    )
+    max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     history: List[str] = []
 
     with progress_bar(console) as progress:
@@ -2348,6 +2524,8 @@ def translate_ass(
                 options,
                 mode="ass_protected",
                 rolling_context=context_hint,
+                allow_partial=fast_mode,
+                max_split_depth=max_split_depth,
             )
             for item, candidate in zip(batch, out):
                 candidate_text = candidate if candidate is not None else item["protected_text"]
@@ -2356,9 +2534,16 @@ def translate_ass(
                 status = scan_ass_line_candidate(item, candidate_text, target_lang)
                 item["candidate"] = status["candidate"]
                 item["status"] = status
+                bump_status_reason_counters(status)
 
-            failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
+            failed_items = [
+                item
+                for item in batch
+                if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+            ]
             repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
+            if fast_mode and failed_items:
+                failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
             if failed_items:
                 if len(failed_items) > repair_limit:
                     cprint(
@@ -2366,19 +2551,38 @@ def translate_ass(
                         f"High fail-rate: {len(failed_items)}/{len(batch)} ASS flagged. Retrying batch @temp=0...",
                         "yellow",
                     )
-                retry_failed_items_batch(
+                if len(failed_items) > repair_limit or not fast_mode:
+                    retry_failed_items_batch(
+                        client,
+                        failed_items,
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        mode="ass_protected",
+                        format_mode="schema",
+                        allow_partial=fast_mode,
+                        max_split_depth=max_split_depth,
+                    )
+                    failed_items = [
+                        item
+                        for item in batch
+                        if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                    ]
+                    if fast_mode and failed_items:
+                        failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
+            if failed_items:
+                run_ass_surgical_fallback(
                     client,
                     failed_items,
                     summary,
                     tone_guide,
                     target_lang,
                     options,
-                    mode="ass_protected",
-                    format_mode="schema",
+                    console,
+                    fast_mode=fast_mode,
+                    fast_budget=(fast_repair_budget(len(batch)) if fast_mode else None),
                 )
-                failed_items = [item for item in batch if item["status"]["needs_llm_repair"]]
-            if failed_items:
-                run_ass_surgical_fallback(client, failed_items, summary, tone_guide, target_lang, options, console)
 
             for item in batch:
                 status = item["status"]
@@ -2388,9 +2592,13 @@ def translate_ass(
                         final_text = forced
                     else:
                         final_text = item["original_text_field"]
-                elif status["ok"] or not any(reason in severe_reasons for reason in status["reasons"]):
+                elif status["ok"] or not needs_llm_repair_for_reasons(status, repair_reasons):
                     final_text = status["restored"]
                 else:
+                    if fast_mode:
+                        item["final_text"] = item["original_text_field"]
+                        history.append(ass_plain_text(item["final_text"]).replace("\n", " ").strip())
+                        continue
                     retried = retry_single_item_translation(
                         client,
                         item["protected_text"],
@@ -3002,11 +3210,13 @@ def apply_fast_profile(args, console) -> None:
         args.rolling_context = 0
     if not args.skip_summary:
         args.skip_summary = True
+    if not args.one_shot:
+        args.one_shot = True
     gpu_display = args.num_gpu if args.num_gpu is not None else "auto"
     cprint(
         console,
         f"Fast profile: batch={args.batch_size}, ctx={args.num_ctx}, predict={args.num_predict}, "
-        f"threads={args.num_threads}, gpu={gpu_display}, rolling={args.rolling_context}, summary=off",
+        f"threads={args.num_threads}, gpu={gpu_display}, rolling={args.rolling_context}, summary=off, one_shot=on",
         "bold cyan",
     )
 
@@ -3022,6 +3232,137 @@ def build_ollama_options(args) -> dict:
     if args.num_gpu is not None:
         options["num_gpu"] = args.num_gpu
     return options
+
+
+def build_single_file_subprocess_cmd(args, in_path: Path, out_path: Path) -> List[str]:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--in",
+        str(in_path),
+        "--out",
+        str(out_path),
+        "--model",
+        str(args.model),
+        "--host",
+        str(args.host),
+        "--target",
+        str(args.target),
+        "--batch-size",
+        str(args.batch_size),
+        "--summary-chars",
+        str(args.summary_chars),
+        "--timeout",
+        str(args.timeout),
+        "--keep-alive",
+        str(args.keep_alive),
+        "--temperature",
+        str(args.temperature),
+        "--ass-mode",
+        str(args.ass_mode),
+        "--rolling-context",
+        str(args.rolling_context),
+        "--format-mode",
+        str(args.format_mode),
+        "--parallel-files",
+        "1",
+    ]
+    if args.num_predict is not None:
+        cmd.extend(["--num-predict", str(args.num_predict)])
+    if args.num_ctx is not None:
+        cmd.extend(["--num-ctx", str(args.num_ctx)])
+    if args.num_threads is not None:
+        cmd.extend(["--num-threads", str(args.num_threads)])
+    if args.num_gpu is not None:
+        cmd.extend(["--num-gpu", str(args.num_gpu)])
+    if args.limit is not None:
+        cmd.extend(["--limit", str(args.limit)])
+    if args.skip_summary:
+        cmd.append("--skip-summary")
+    if args.fast:
+        cmd.append("--fast")
+    if args.one_shot:
+        cmd.append("--one-shot")
+    if args.minify_json:
+        cmd.append("--minify-json")
+    else:
+        cmd.append("--no-minify-json")
+    if args.bench:
+        cmd.append("--bench")
+    return cmd
+
+
+def run_subprocess_translation(cmd: List[str]) -> Tuple[int, float, str]:
+    started = time.perf_counter()
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    elapsed = time.perf_counter() - started
+    combined_output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    return proc.returncode, elapsed, combined_output
+
+
+def extract_translation_summary(output: str) -> str:
+    if not output:
+        return ""
+    lines = output.splitlines()
+    patterns = (
+        "Elapsed (translate):",
+        "Retry counters:",
+        "Fast retry budget:",
+        "Split stats:",
+        "Top flagged reasons:",
+        "Ollama calls:",
+    )
+    selected = [line.strip() for line in lines if any(p in line for p in patterns)]
+    if not selected:
+        return ""
+    return " | ".join(selected)
+
+
+def translate_many_files_parallel_subprocess(console, args, jobs: List[Tuple[Path, Path]]) -> Tuple[int, int]:
+    max_workers = max(1, int(args.parallel_files or 1))
+    total = len(jobs)
+    cprint(
+        console,
+        f"Parallel file mode: workers={max_workers}, jobs={total}",
+        "bold cyan",
+    )
+    ok = 0
+    failed = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(run_subprocess_translation, build_single_file_subprocess_cmd(args, in_path, out_path)): (in_path, out_path)
+            for in_path, out_path in jobs
+        }
+        for future in as_completed(future_map):
+            done += 1
+            in_path, _ = future_map[future]
+            try:
+                code, elapsed, output = future.result()
+            except Exception as exc:
+                failed += 1
+                cprint(console, f"[{done}/{total}] FAIL {in_path.name}: {exc}", "bold red")
+                continue
+            if code == 0:
+                ok += 1
+                summary = extract_translation_summary(output)
+                cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
+                if summary:
+                    console.print(summary)
+                continue
+            failed += 1
+            cprint(console, f"[{done}/{total}] FAIL {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
+            if output.strip():
+                tail = "\n".join(output.splitlines()[-30:])
+                console.print(tail)
+    return ok, failed
 
 
 def translate_single_file(client, console, args, in_path: Path, out_path: Path) -> int:
@@ -3066,6 +3407,7 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
                 args.ass_mode,
                 args.one_shot,
                 args.rolling_context,
+                args.fast,
             )
         elif ext == ".srt":
             out_text, translated_count = translate_srt(
@@ -3080,6 +3422,7 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
                 console,
                 args.one_shot,
                 args.rolling_context,
+                args.fast,
             )
         else:
             print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
@@ -3119,6 +3462,12 @@ def main() -> int:
     parser.add_argument("--skip-summary", action="store_true", help="Skip the summary step")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode")
     parser.add_argument("--batch", action="store_true", help="Translate all subtitle files in SUBS_BULK")
+    parser.add_argument(
+        "--parallel-files",
+        type=int,
+        default=1,
+        help="Translate multiple files in parallel for --batch or multi-file mode (subprocess workers)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite outputs in --batch mode")
     parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
     parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
@@ -3159,6 +3508,9 @@ def main() -> int:
         return 2
     if args.batch and args.out_path:
         print("--out is not supported in --batch mode", file=sys.stderr)
+        return 2
+    if args.parallel_files < 1:
+        print("--parallel-files must be >= 1", file=sys.stderr)
         return 2
 
     in_paths: List[Path] = []
@@ -3207,19 +3559,27 @@ def main() -> int:
         ok = 0
         skipped = 0
         failed = 0
+        jobs: List[Tuple[Path, Path]] = []
         for file_path in files:
             out_file = build_output_path(file_path, args.target)
             if out_file.exists() and not args.overwrite:
                 skipped += 1
                 cprint(console, f"Skip (exists): {out_file.name}", "yellow")
                 continue
+            jobs.append((file_path, out_file))
 
-            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
-            code = translate_single_file(client, console, args, file_path, out_file)
-            if code == 0:
-                ok += 1
-            else:
-                failed += 1
+        if args.parallel_files > 1 and len(jobs) > 1:
+            p_ok, p_failed = translate_many_files_parallel_subprocess(console, args, jobs)
+            ok += p_ok
+            failed += p_failed
+        else:
+            for file_path, out_file in jobs:
+                cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+                code = translate_single_file(client, console, args, file_path, out_file)
+                if code == 0:
+                    ok += 1
+                else:
+                    failed += 1
 
         cprint(
             console,
@@ -3241,19 +3601,27 @@ def main() -> int:
         ok = 0
         skipped = 0
         failed = 0
+        jobs: List[Tuple[Path, Path]] = []
         for file_path in in_paths:
             out_file = build_output_path(file_path, args.target)
             if out_file.exists() and not args.overwrite:
                 skipped += 1
                 cprint(console, f"Skip (exists): {out_file.name}", "yellow")
                 continue
+            jobs.append((file_path, out_file))
 
-            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
-            code = translate_single_file(client, console, args, file_path, out_file)
-            if code == 0:
-                ok += 1
-            else:
-                failed += 1
+        if args.parallel_files > 1 and len(jobs) > 1:
+            p_ok, p_failed = translate_many_files_parallel_subprocess(console, args, jobs)
+            ok += p_ok
+            failed += p_failed
+        else:
+            for file_path, out_file in jobs:
+                cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+                code = translate_single_file(client, console, args, file_path, out_file)
+                if code == 0:
+                    ok += 1
+                else:
+                    failed += 1
 
         cprint(
             console,
