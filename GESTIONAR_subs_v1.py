@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GESTIONAR_subs_v1.py
-Version 3.3 - 09-feb-2026
+Version 3.4 - 20-feb-2026
 
 - Usa SUBS_BULK como carpeta de trabajo para videos y subtitulos.
 - Extrae subtitulos de los videos detectados.
@@ -23,6 +23,10 @@ Mejoras 3.3:
 - Escaneo de MKV via mkvmerge (rapido) cuando MKVToolNix esta disponible.
 - Extraccion por video en lote (una invocacion por archivo) via mkvextract/ffmpeg.
 - Omitir automaticamente subtitulos basados en imagen (PGS/VobSub/DVB) que requieren OCR.
+
+Mejoras 3.4:
+- Resumen de cobertura tras escaneo: pistas por video e idiomas compartidos/no compartidos.
+- En la seleccion de idiomas se muestra cobertura por videos (X/Y) ademas del total de pistas.
 """
 
 import json
@@ -113,6 +117,8 @@ LANG_TITLE_MAP = {
 
 CONSOLE = Console() if RICH_AVAILABLE else None
 LANGUAGE_COUNT_HINT = {}
+LANGUAGE_VIDEO_HINT = {}
+LANGUAGE_TOTAL_VIDEO_HINT = 0
 DISCARD_DIR_NAME = "__subs_descartados"
 
 SDH_CUE_RE = re.compile(
@@ -402,6 +408,75 @@ def _summarize_streams_by_language(streams: List[Tuple[str, int, str, str, str]]
     for file_name, idx, lang, codec, _tool in streams:
         by_lang[lang].append((file_name, idx, codec))
     return by_lang
+
+
+def _build_scan_coverage(path: str, streams: List[Tuple[str, int, str, str, str]]):
+    videos = list_video_files(path)
+    by_video = {video_name: [] for video_name in videos}
+    by_lang_videos = defaultdict(set)
+
+    for video_name, idx, lang, codec, _tool in streams:
+        by_video.setdefault(video_name, []).append((int(idx), str(lang), str(codec)))
+        by_lang_videos[str(lang)].add(video_name)
+
+    for items in by_video.values():
+        items.sort(key=lambda x: (int(x[0]), str(x[1]).lower(), str(x[2]).lower()))
+
+    return videos, by_video, by_lang_videos
+
+
+def _print_scan_coverage(videos, by_video, by_lang_videos) -> None:
+    if not videos:
+        return
+
+    total_videos = len(videos)
+    videos_with_subs = sum(1 for v in videos if by_video.get(v))
+    videos_without_subs = total_videos - videos_with_subs
+
+    ui_section("Resumen Cobertura Subtitulos")
+    ui_print(f"Videos analizados: {total_videos}")
+    ui_print(f"Videos con subtitulos: {videos_with_subs}")
+    if videos_without_subs:
+        ui_print(
+            f"Videos sin subtitulos: {videos_without_subs}",
+            style="bold yellow" if RICH_AVAILABLE else None,
+        )
+
+    if by_lang_videos:
+        shared_langs = sorted(lang for lang, vids in by_lang_videos.items() if len(vids) == total_videos)
+        if shared_langs:
+            ui_print(
+                f"Idiomas compartidos por todos: {', '.join(shared_langs)}",
+                style="bold green" if RICH_AVAILABLE else None,
+            )
+        else:
+            ui_print(
+                "Idiomas compartidos por todos: ninguno",
+                style="bold yellow" if RICH_AVAILABLE else None,
+            )
+
+        ui_print("Cobertura por idioma:")
+        for lang, vids in sorted(by_lang_videos.items(), key=lambda x: (-len(x[1]), x[0].lower())):
+            ui_print(f"- {lang}: {len(vids)}/{total_videos} video(s)")
+
+    ui_section("Detalle Subtitulos por Video")
+    for video_name in videos:
+        tracks = by_video.get(video_name) or []
+        if not tracks:
+            ui_print(
+                f"- {shorten_name(video_name)} -> 0 pista(s)",
+                style="yellow" if RICH_AVAILABLE else None,
+            )
+            continue
+
+        lang_counts = defaultdict(int)
+        for _idx, lang, _codec in tracks:
+            lang_counts[lang] += 1
+        lang_summary = ", ".join(
+            f"{lang}x{count}" if count > 1 else lang
+            for lang, count in sorted(lang_counts.items(), key=lambda x: x[0].lower())
+        )
+        ui_print(f"- {shorten_name(video_name)} -> {len(tracks)} pista(s) | idiomas: {lang_summary}")
 
 
 def _print_duplicate_streams(streams: List[Tuple[str, int, str, str, str]]) -> None:
@@ -713,9 +788,19 @@ def seleccionar_idiomas(idiomas):
     ui_title("Idiomas encontrados")
     # `idiomas` is already sorted; show counts if available via global hint.
     for i, lang in enumerate(idiomas, 1):
-        hint = LANGUAGE_COUNT_HINT.get(lang)
-        if hint is not None:
-            ui_print(f" {i}. {lang} ({hint} pista(s))", style="cyan" if RICH_AVAILABLE else None)
+        track_hint = LANGUAGE_COUNT_HINT.get(lang)
+        video_hint = LANGUAGE_VIDEO_HINT.get(lang)
+        if (
+            track_hint is not None
+            and video_hint is not None
+            and LANGUAGE_TOTAL_VIDEO_HINT
+        ):
+            ui_print(
+                f" {i}. {lang} ({track_hint} pista(s), {video_hint}/{LANGUAGE_TOTAL_VIDEO_HINT} video(s))",
+                style="cyan" if RICH_AVAILABLE else None,
+            )
+        elif track_hint is not None:
+            ui_print(f" {i}. {lang} ({track_hint} pista(s))", style="cyan" if RICH_AVAILABLE else None)
         else:
             ui_print(f" {i}. {lang}", style="cyan" if RICH_AVAILABLE else None)
     ui_print(" Tip: escribe 'all' para seleccionar todos.", style="dim" if RICH_AVAILABLE else None)
@@ -1566,11 +1651,15 @@ def main():
             use_cache=not args.no_scan_cache,
         )
 
-        global LANGUAGE_COUNT_HINT
+        global LANGUAGE_COUNT_HINT, LANGUAGE_VIDEO_HINT, LANGUAGE_TOTAL_VIDEO_HINT
         LANGUAGE_COUNT_HINT = {lang: len(items) for lang, items in _summarize_streams_by_language(streams).items()}
+        scan_videos, scan_by_video, scan_by_lang_videos = _build_scan_coverage(bulk_dir, streams)
+        LANGUAGE_TOTAL_VIDEO_HINT = len(scan_videos)
+        LANGUAGE_VIDEO_HINT = {lang: len(videos_set) for lang, videos_set in scan_by_lang_videos.items()}
         if not streams:
             ui_status('info', "No se detectaron pistas de subtitulos en videos dentro de SUBS_BULK.")
         else:
+            _print_scan_coverage(scan_videos, scan_by_video, scan_by_lang_videos)
             _print_duplicate_streams(streams)
             idiomas_seleccionados = seleccionar_idiomas(idiomas)
             if not idiomas_seleccionados:
