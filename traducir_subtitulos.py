@@ -50,6 +50,7 @@ LABEL_PREFIX_RE = re.compile(
 )
 SPANISH_MARKER_RE = re.compile(r"[áéíóúñüÁÉÍÓÚÑÜ]")
 CREDITS_OVERRIDE_RE = re.compile(r"\bBrought to you by\s*\[[^\]]+\]", flags=re.IGNORECASE)
+SRT_WATERMARK_TOKEN_RE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_.-]{4,}")
 HONORIFICS = {"mr", "mrs", "ms", "miss", "sir", "ma'am", "madam"}
 SUMMARY_MARKERS = (
     "summary",
@@ -1125,6 +1126,15 @@ def should_translate(segment: str) -> bool:
     return bool(re.search(r"[A-Za-z]", segment))
 
 
+def should_skip_srt_block_translation(text: str) -> bool:
+    normalized = " ".join(part.strip() for part in (text or "").split("\n") if part.strip())
+    if not normalized:
+        return True
+    if not should_translate(normalized):
+        return True
+    return SRT_WATERMARK_TOKEN_RE.fullmatch(normalized) is not None
+
+
 def split_ass_text(text: str) -> List[str]:
     parts = ASS_TAG_RE.split(text)
     return [p for p in parts if p is not None and p != ""]
@@ -1471,7 +1481,7 @@ def translate_json_batch(
         texts=texts,
         force_temperature_zero=force_temperature_zero,
     )
-    if mode == "ass_protected" and not force_temperature_zero:
+    if mode in {"ass_protected", "srt_block"} and not force_temperature_zero:
         options_batch["temperature"] = 0.0
     request_format: str | dict
     used_auto_json = False
@@ -1629,6 +1639,9 @@ def repair_issue_score(reasons: List[str]) -> int:
         "empty_output": 6,
         "placeholder_mismatch": 6,
         "unchanged": 6,
+        "duplicate_output": 6,
+        "short_line_overflow": 5,
+        "length_mismatch": 4,
         "placeholder_artifacts": 5,
         "unexpected_ass_markup": 4,
         "language_leak": 4,
@@ -1837,6 +1850,74 @@ def self_test_hybrid_pipeline() -> None:
     srt_source = {"original_text_field": "Hello\nthere", "expected_line_count": 2}
     srt_status = scan_srt_candidate(srt_source, "Hola\nalli", "Spanish")
     assert srt_status["ok"]
+    srt_wrap_status = scan_srt_candidate(srt_source, "Hola alli", "Spanish")
+    assert "line_break_mismatch" in srt_wrap_status["reasons"]
+    assert not srt_wrap_status["needs_llm_repair"]
+    assert should_skip_srt_block_translation("Katmovie18")
+    assert not should_skip_srt_block_translation("Whatever.")
+    duplicate_batch = [
+        {
+            "original_text_field": "I saw him near the station yesterday.",
+            "status": scan_srt_candidate(
+                {"original_text_field": "I saw him near the station yesterday.", "expected_line_count": 1},
+                "Lo vi cerca de la estacion ayer.",
+                "Spanish",
+            ),
+        },
+        {
+            "original_text_field": "Please lock the front door before sleeping.",
+            "status": scan_srt_candidate(
+                {"original_text_field": "Please lock the front door before sleeping.", "expected_line_count": 1},
+                "Lo vi cerca de la estacion ayer.",
+                "Spanish",
+            ),
+        },
+    ]
+    mark_duplicate_srt_batch_outputs(duplicate_batch)
+    assert "duplicate_output" in duplicate_batch[1]["status"]["reasons"]
+    assert duplicate_batch[1]["status"]["needs_llm_repair"]
+    duplicate_window_batch = [
+        {
+            "original_text_field": "Keep the back gate locked tonight.",
+            "status": scan_srt_candidate(
+                {"original_text_field": "Keep the back gate locked tonight.", "expected_line_count": 1},
+                "Manten cerrada la puerta trasera esta noche.",
+                "Spanish",
+            ),
+        },
+        {
+            "original_text_field": "Okay.",
+            "status": scan_srt_candidate(
+                {"original_text_field": "Okay.", "expected_line_count": 1},
+                "Vale.",
+                "Spanish",
+            ),
+        },
+        {
+            "original_text_field": "Please turn off the lights before leaving.",
+            "status": scan_srt_candidate(
+                {"original_text_field": "Please turn off the lights before leaving.", "expected_line_count": 1},
+                "Manten cerrada la puerta trasera esta noche.",
+                "Spanish",
+            ),
+        },
+    ]
+    mark_duplicate_srt_batch_outputs(duplicate_window_batch)
+    assert "duplicate_output" in duplicate_window_batch[2]["status"]["reasons"]
+    overflow_status = scan_srt_candidate(
+        {"original_text_field": "I mean,", "expected_line_count": 1},
+        "No lo creo, senora. Disculpa? O sea,",
+        "Spanish",
+    )
+    assert "short_line_overflow" in overflow_status["reasons"]
+    assert overflow_status["needs_llm_repair"]
+    length_status = scan_srt_candidate(
+        {"original_text_field": "it is not in academics.", "expected_line_count": 1},
+        "Aun esta descubriendo en que area puede destacar realmente frente a los demas.",
+        "Spanish",
+    )
+    assert "length_mismatch" in length_status["reasons"]
+    assert length_status["needs_llm_repair"]
     miss_src = "Miss Ito,"
     miss_protected, miss_repl = ass_protect_tags(miss_src)
     miss_state = {
@@ -1945,6 +2026,8 @@ def parse_srt_ir(text: str, limit: int | None) -> Tuple[List[List[str]], List[di
         overridden_text = apply_phrase_overrides(joined)
         if overridden_text != joined:
             fixed_final_text = overridden_text
+        elif should_skip_srt_block_translation(joined):
+            fixed_final_text = joined
         item = {
             "id": ("srt_block", block_idx),
             "kind": "srt_block",
@@ -1983,6 +2066,37 @@ def enforce_line_count(text: str, expected_count: int) -> str:
     return "\n".join(out_lines)
 
 
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def mark_duplicate_srt_batch_outputs(items: List[dict]) -> None:
+    recent: List[Tuple[str, str]] = []
+    for item in items:
+        status = item.get("status")
+        if not isinstance(status, dict):
+            continue
+        candidate = _normalize_ws(status.get("candidate", ""))
+        source = _normalize_ws(item.get("original_text_field", ""))
+        if candidate:
+            for prev_candidate, prev_source in recent[-3:]:
+                if candidate != prev_candidate:
+                    continue
+                if not source or source == prev_source:
+                    continue
+                if count_words(candidate) >= 3 or len(candidate) >= 20:
+                    if count_words(source) >= 3 or count_words(prev_source) >= 3:
+                        reasons = list(status.get("reasons") or [])
+                        if "duplicate_output" not in reasons:
+                            reasons.append("duplicate_output")
+                            status["reasons"] = reasons
+                            status["ok"] = False
+                            status["needs_llm_repair"] = True
+                            status["score"] = repair_issue_score(reasons)
+                        break
+        recent.append((candidate, source))
+
+
 def scan_srt_candidate(item: dict, candidate: str, target_lang: str) -> dict:
     cleaned = strip_label_prefix(candidate or "")
     source_text = item["original_text_field"]
@@ -2000,9 +2114,33 @@ def scan_srt_candidate(item: dict, candidate: str, target_lang: str) -> dict:
         reasons.append("language_leak")
     if is_very_suspicious_translation(source_text, cleaned):
         reasons.append("very_suspicious")
+    src_words = count_words(source_text)
+    dst_words = count_words(cleaned)
+    if src_words <= 3 and dst_words >= max(5, src_words * 3):
+        reasons.append("short_line_overflow")
+    elif src_words <= 3:
+        sentence_marks = cleaned.count(".") + cleaned.count("?") + cleaned.count("!")
+        if sentence_marks >= 2 and dst_words >= 4:
+            reasons.append("short_line_overflow")
+        elif ("?" in source_text) and ("?" not in cleaned and "¿" not in cleaned) and dst_words >= 3:
+            reasons.append("short_line_overflow")
+    elif 4 <= src_words <= 10:
+        if dst_words <= 1 or dst_words >= int(math.ceil(src_words * 1.8)) + 1:
+            reasons.append("length_mismatch")
 
+    # For SRT we can safely normalize line wraps later with enforce_line_count().
+    # Treat line break drift as non-fatal to avoid expensive false-positive retries.
     needs_repair = any(
-        reason in {"empty_output", "label_prefix", "line_break_mismatch", "unchanged", "language_leak", "very_suspicious"}
+        reason
+        in {
+            "empty_output",
+            "label_prefix",
+            "unchanged",
+            "language_leak",
+            "very_suspicious",
+            "short_line_overflow",
+            "length_mismatch",
+        }
         for reason in reasons
     )
     return {
@@ -2360,7 +2498,16 @@ def translate_srt(
     repair_reasons = (
         {"empty_output", "label_prefix", "unchanged"}
         if fast_mode
-        else {"empty_output", "label_prefix", "line_break_mismatch", "unchanged", "language_leak", "very_suspicious"}
+        else {
+            "empty_output",
+            "label_prefix",
+            "unchanged",
+            "language_leak",
+            "very_suspicious",
+            "duplicate_output",
+            "short_line_overflow",
+            "length_mismatch",
+        }
     )
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
@@ -2393,7 +2540,9 @@ def translate_srt(
                     status = scan_srt_candidate(item, candidate or "", target_lang)
                     item["candidate"] = status["candidate"]
                     item["status"] = status
-                    bump_status_reason_counters(status)
+                mark_duplicate_srt_batch_outputs(work_batch)
+                for item in work_batch:
+                    bump_status_reason_counters(item["status"])
 
                 failed_items = [
                     item
@@ -3493,6 +3642,14 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
 
     summary = ""
     tone_guide = ""
+    srt_rolling_context = args.rolling_context
+    if ext == ".srt" and srt_rolling_context > 0:
+        cprint(
+            console,
+            "SRT mode: forcing rolling-context=0 to avoid cross-block drift.",
+            "yellow",
+        )
+        srt_rolling_context = 0
     if not args.skip_summary:
         cprint(console, "Building summary...", "bold cyan")
         with RUNTIME_METRICS.timed("stage.summary"):
@@ -3540,7 +3697,7 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
                 args.limit,
                 console,
                 args.one_shot,
-                args.rolling_context,
+                srt_rolling_context,
                 args.fast,
             )
         else:
