@@ -3325,12 +3325,36 @@ def extract_translation_summary(output: str) -> str:
     return " | ".join(selected)
 
 
-def translate_many_files_parallel_subprocess(console, args, jobs: List[Tuple[Path, Path]]) -> Tuple[int, int]:
+def format_global_file_progress(done: int, total: int, ok: int, skipped: int, failed: int) -> str:
+    if total <= 0:
+        pct = 100.0
+        remaining = 0
+    else:
+        pct = (done / float(total)) * 100.0
+        remaining = max(0, total - done)
+    return (
+        f"Global progress: {done}/{total} ({pct:.0f}%) | "
+        f"ok={ok}, skipped={skipped}, failed={failed}, remaining={remaining}"
+    )
+
+
+def print_global_file_progress(console, done: int, total: int, ok: int, skipped: int, failed: int) -> None:
+    style = "bold cyan" if failed == 0 else "bold yellow"
+    cprint(console, format_global_file_progress(done, total, ok, skipped, failed), style)
+
+
+def translate_many_files_parallel_subprocess(
+    console,
+    args,
+    jobs: List[Tuple[Path, Path]],
+    selected_total: int,
+    skipped: int = 0,
+) -> Tuple[int, int]:
     max_workers = max(1, int(args.parallel_files or 1))
     total = len(jobs)
     cprint(
         console,
-        f"Parallel file mode: workers={max_workers}, jobs={total}",
+        f"Parallel file mode: workers={max_workers}, jobs={total}, selected={selected_total}",
         "bold cyan",
     )
     ok = 0
@@ -3349,6 +3373,14 @@ def translate_many_files_parallel_subprocess(console, args, jobs: List[Tuple[Pat
             except Exception as exc:
                 failed += 1
                 cprint(console, f"[{done}/{total}] FAIL {in_path.name}: {exc}", "bold red")
+                print_global_file_progress(
+                    console,
+                    skipped + done,
+                    selected_total,
+                    ok,
+                    skipped,
+                    failed,
+                )
                 continue
             if code == 0:
                 ok += 1
@@ -3356,12 +3388,28 @@ def translate_many_files_parallel_subprocess(console, args, jobs: List[Tuple[Pat
                 cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
                 if summary:
                     console.print(summary)
+                print_global_file_progress(
+                    console,
+                    skipped + done,
+                    selected_total,
+                    ok,
+                    skipped,
+                    failed,
+                )
                 continue
             failed += 1
             cprint(console, f"[{done}/{total}] FAIL {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
             if output.strip():
                 tail = "\n".join(output.splitlines()[-30:])
                 console.print(tail)
+            print_global_file_progress(
+                console,
+                skipped + done,
+                selected_total,
+                ok,
+                skipped,
+                failed,
+            )
     return ok, failed
 
 
@@ -3438,6 +3486,51 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
     cprint(console, f"Elapsed (total): {total_elapsed:.1f}s", "bold green")
     print_runtime_breakdown(console, total_elapsed)
     return 0
+
+
+def run_multi_file_jobs(
+    client,
+    console,
+    args,
+    jobs: List[Tuple[Path, Path]],
+    selected_total: int,
+    skipped: int,
+) -> Tuple[int, int]:
+    ok = 0
+    failed = 0
+    if selected_total > 1:
+        print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
+
+    if args.parallel_files > 1 and len(jobs) > 1:
+        return translate_many_files_parallel_subprocess(
+            console,
+            args,
+            jobs,
+            selected_total=selected_total,
+            skipped=skipped,
+        )
+
+    for file_path, out_file in jobs:
+        if selected_total > 1:
+            next_global = skipped + ok + failed + 1
+            cprint(console, f"\n=== Translating [{next_global}/{selected_total}]: {file_path.name} ===", "bold cyan")
+        else:
+            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+        code = translate_single_file(client, console, args, file_path, out_file)
+        if code == 0:
+            ok += 1
+        else:
+            failed += 1
+        if selected_total > 1:
+            print_global_file_progress(
+                console,
+                skipped + ok + failed,
+                selected_total,
+                ok,
+                skipped,
+                failed,
+            )
+    return ok, failed
 
 
 def main() -> int:
@@ -3556,9 +3649,8 @@ def main() -> int:
             cprint(console, "No subtitle files found for batch translation.", "yellow")
             return 0
 
-        ok = 0
+        selected_total = len(files)
         skipped = 0
-        failed = 0
         jobs: List[Tuple[Path, Path]] = []
         for file_path in files:
             out_file = build_output_path(file_path, args.target)
@@ -3568,18 +3660,14 @@ def main() -> int:
                 continue
             jobs.append((file_path, out_file))
 
-        if args.parallel_files > 1 and len(jobs) > 1:
-            p_ok, p_failed = translate_many_files_parallel_subprocess(console, args, jobs)
-            ok += p_ok
-            failed += p_failed
-        else:
-            for file_path, out_file in jobs:
-                cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
-                code = translate_single_file(client, console, args, file_path, out_file)
-                if code == 0:
-                    ok += 1
-                else:
-                    failed += 1
+        ok, failed = run_multi_file_jobs(
+            client,
+            console,
+            args,
+            jobs,
+            selected_total=selected_total,
+            skipped=skipped,
+        )
 
         cprint(
             console,
@@ -3598,9 +3686,8 @@ def main() -> int:
             print("--out is not supported when translating multiple inputs", file=sys.stderr)
             return 2
 
-        ok = 0
+        selected_total = len(in_paths)
         skipped = 0
-        failed = 0
         jobs: List[Tuple[Path, Path]] = []
         for file_path in in_paths:
             out_file = build_output_path(file_path, args.target)
@@ -3610,18 +3697,14 @@ def main() -> int:
                 continue
             jobs.append((file_path, out_file))
 
-        if args.parallel_files > 1 and len(jobs) > 1:
-            p_ok, p_failed = translate_many_files_parallel_subprocess(console, args, jobs)
-            ok += p_ok
-            failed += p_failed
-        else:
-            for file_path, out_file in jobs:
-                cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
-                code = translate_single_file(client, console, args, file_path, out_file)
-                if code == 0:
-                    ok += 1
-                else:
-                    failed += 1
+        ok, failed = run_multi_file_jobs(
+            client,
+            console,
+            args,
+            jobs,
+            selected_total=selected_total,
+            skipped=skipped,
+        )
 
         cprint(
             console,

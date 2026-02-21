@@ -58,6 +58,7 @@ Opciones utiles:
 - `--batch`: traduce en lote todos los `.ass/.srt` de `SUBS_BULK/`.
 - `--parallel-files N`: cantidad de archivos en paralelo en `--batch` o multi-seleccion (usa subprocesos).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
+- En `--batch` y multi-seleccion ahora se imprime progreso global de archivos: `ok/skipped/failed/remaining`.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad.
