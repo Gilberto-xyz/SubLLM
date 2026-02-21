@@ -43,6 +43,7 @@ ASS_STRIP_RE = re.compile(r"\{[^}]*\}")
 PLACEHOLDER_TOKEN_RE = re.compile(r"__TAG_\d+__")
 LEGACY_PLACEHOLDER_RE = re.compile(r"__ASS_TAG_\d+__")
 BROKEN_PLACEHOLDER_RE = re.compile(r"__TAG_(?!\d+__)")
+NONSPACE_TOKEN_RE = re.compile(r"\S+")
 LABEL_PREFIX_RE = re.compile(
     r"^(?P<head>\s*(?:__TAG_\d+__\s*)*)(?P<label>ASS|SRT|SUBS?|CAPTION|DIALOGUE)\s*(?::|-)\s*",
     flags=re.IGNORECASE,
@@ -84,6 +85,8 @@ TRANSLATION_TONE_MAX = 400
 ROLLING_CONTEXT_MAX_CHARS = 600
 FAST_SPLIT_MAX_DEPTH = 1
 FAST_REPAIR_RATIO = 0.04
+ADAPTIVE_BATCH_MIN_ITEMS = 8
+ADAPTIVE_BATCH_REDUCE_FACTOR = 0.75
 T = TypeVar("T")
 FORMAT_MODE = "auto"
 MINIFY_JSON_PROMPTS = True
@@ -1163,7 +1166,24 @@ def trim_translation_context(summary: str, tone_guide: str) -> Tuple[str, str]:
 
 
 def estimate_tokens_from_text(text: str) -> int:
-    return max(1, int(math.ceil(len(text or "") / 4.0)))
+    raw = text or ""
+    char_est = int(math.ceil(len(raw) / 4.0))
+    word_est = int(math.ceil(len(NONSPACE_TOKEN_RE.findall(raw)) * 0.90))
+    # Placeholders/token-like artifacts are usually more expensive than plain text.
+    placeholder_penalty = (
+        len(PLACEHOLDER_TOKEN_RE.findall(raw)) * 3
+        + len(LEGACY_PLACEHOLDER_RE.findall(raw)) * 3
+        + len(BROKEN_PLACEHOLDER_RE.findall(raw)) * 2
+    )
+    newline_penalty = raw.count("\n")
+    return max(1, max(char_est, word_est) + placeholder_penalty + newline_penalty)
+
+
+def reduce_adaptive_batch_cap(current_cap: int) -> int:
+    if current_cap <= ADAPTIVE_BATCH_MIN_ITEMS:
+        return current_cap
+    reduced = int(math.floor(current_cap * ADAPTIVE_BATCH_REDUCE_FACTOR))
+    return max(ADAPTIVE_BATCH_MIN_ITEMS, reduced)
 
 
 def translation_budget(options) -> Tuple[int, int]:
@@ -1643,6 +1663,11 @@ def recover_ass_candidate_placeholders(state: dict, candidate: str) -> str | Non
     if not cleaned.strip():
         return None
     plain = ass_plain_text(cleaned).strip()
+    # If the model leaked placeholder-like tokens in plain text, drop them before slot rebuild.
+    plain = PLACEHOLDER_TOKEN_RE.sub(" ", plain)
+    plain = LEGACY_PLACEHOLDER_RE.sub(" ", plain)
+    plain = BROKEN_PLACEHOLDER_RE.sub(" ", plain)
+    plain = re.sub(r"[ \t]+", " ", plain).strip()
     if not plain:
         return None
     tokens = list(state.get("tokens") or split_ass_text(state["text_field"]))
@@ -1693,7 +1718,7 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
     reasons = evaluation["reasons"]
 
     # Recover common case where model translated text but dropped __TAG_n__ placeholders.
-    if "placeholder_mismatch" in reasons:
+    if "placeholder_mismatch" in reasons or "placeholder_artifacts" in reasons:
         recovered = recover_ass_candidate_placeholders(state, cleaned)
         if recovered is not None and recovered != cleaned:
             evaluation = evaluate_ass_line_candidate(state, recovered, target_lang)
@@ -2340,113 +2365,136 @@ def translate_srt(
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
+    active_batch_cap = ass_batch_cap
     history: List[str] = []
     with progress_bar(console) as progress:
         task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
-            RUNTIME_METRICS.bump("translate.top_level_batches", 1)
-            RUNTIME_METRICS.bump("translate.top_level_batch_items", len(batch))
-            sources = [item["protected_text"] for item in batch]
-            context_hint = rolling_context_snippet(history, rolling_context)
-            out = translate_json_batch_with_split(
-                client,
-                sources,
-                summary,
-                tone_guide,
-                target_lang,
-                options,
-                mode="srt_block",
-                rolling_context=context_hint,
-                allow_partial=fast_mode,
-                max_split_depth=max_split_depth,
-            )
-            for item, candidate in zip(batch, out):
-                status = scan_srt_candidate(item, candidate or "", target_lang)
-                item["candidate"] = status["candidate"]
-                item["status"] = status
-                bump_status_reason_counters(status)
-
-            failed_items = [
-                item
-                for item in batch
-                if needs_llm_repair_for_reasons(item["status"], repair_reasons)
-            ]
-            repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
-            if fast_mode and failed_items:
-                failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
-            if failed_items and len(failed_items) > repair_limit:
-                cprint(
-                    console,
-                    f"High fail-rate: {len(failed_items)}/{len(batch)} SRT flagged. Retrying batch @temp=0...",
-                    "yellow",
-                )
-                retry_failed_items_batch(
+            work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
+            for work_batch in work_batches:
+                RUNTIME_METRICS.bump("translate.top_level_batches", 1)
+                RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
+                sources = [item["protected_text"] for item in work_batch]
+                context_hint = rolling_context_snippet(history, rolling_context)
+                split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
+                out = translate_json_batch_with_split(
                     client,
-                    failed_items,
+                    sources,
                     summary,
                     tone_guide,
                     target_lang,
                     options,
                     mode="srt_block",
+                    rolling_context=context_hint,
                     allow_partial=fast_mode,
                     max_split_depth=max_split_depth,
                 )
+                for item, candidate in zip(work_batch, out):
+                    status = scan_srt_candidate(item, candidate or "", target_lang)
+                    item["candidate"] = status["candidate"]
+                    item["status"] = status
+                    bump_status_reason_counters(status)
+
                 failed_items = [
                     item
-                    for item in batch
+                    for item in work_batch
                     if needs_llm_repair_for_reasons(item["status"], repair_reasons)
                 ]
-                if fast_mode and failed_items:
-                    failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
-            if failed_items and not fast_mode:
-                for item in failed_items:
-                    repaired = fallback_srt_linewise(
-                        client,
-                        item,
-                        summary,
-                        tone_guide,
-                        target_lang,
-                        options,
-                    )
-                    if repaired is not None:
-                        item["forced_text"] = repaired
+                split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
+                severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
+                if (
+                    not fast_mode
+                    and active_batch_cap > ADAPTIVE_BATCH_MIN_ITEMS
+                    and (split_after > split_before or severe_ratio >= 0.35)
+                ):
+                    new_cap = reduce_adaptive_batch_cap(active_batch_cap)
+                    if new_cap < active_batch_cap:
+                        cprint(
+                            console,
+                            (
+                                f"Adaptive batch cap: {active_batch_cap} -> {new_cap} "
+                                f"(split={split_after - split_before}, fail_rate={severe_ratio:.0%})"
+                            ),
+                            "yellow",
+                        )
+                        active_batch_cap = new_cap
 
-            for item in batch:
-                if "forced_text" in item:
-                    final_text = item["forced_text"]
-                elif item["status"]["ok"] or not needs_llm_repair_for_reasons(item["status"], repair_reasons):
-                    final_text = enforce_line_count(
-                        item["status"]["candidate"],
-                        item["expected_line_count"],
+                repair_limit = max(8, int(math.ceil(0.10 * max(1, len(work_batch)))))
+                if fast_mode and failed_items:
+                    failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
+                if failed_items and len(failed_items) > repair_limit:
+                    cprint(
+                        console,
+                        f"High fail-rate: {len(failed_items)}/{len(work_batch)} SRT flagged. Retrying batch @temp=0...",
+                        "yellow",
                     )
-                else:
-                    if fast_mode:
-                        item["final_text"] = item["original_text_field"]
-                        history.append(item["final_text"].replace("\n", " ").strip())
-                        continue
-                    retried = retry_single_item_translation(
+                    retry_failed_items_batch(
                         client,
-                        item["original_text_field"],
+                        failed_items,
                         summary,
                         tone_guide,
                         target_lang,
                         options,
                         mode="srt_block",
+                        allow_partial=fast_mode,
+                        max_split_depth=max_split_depth,
                     )
-                    if retried is not None:
-                        retry_status = scan_srt_candidate(item, retried, target_lang)
-                        if retry_status["ok"]:
-                            final_text = enforce_line_count(
-                                retry_status["candidate"],
-                                item["expected_line_count"],
-                            )
+                    failed_items = [
+                        item
+                        for item in work_batch
+                        if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                    ]
+                    if fast_mode and failed_items:
+                        failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
+                if failed_items and not fast_mode:
+                    for item in failed_items:
+                        repaired = fallback_srt_linewise(
+                            client,
+                            item,
+                            summary,
+                            tone_guide,
+                            target_lang,
+                            options,
+                        )
+                        if repaired is not None:
+                            item["forced_text"] = repaired
+
+                for item in work_batch:
+                    if "forced_text" in item:
+                        final_text = item["forced_text"]
+                    elif item["status"]["ok"] or not needs_llm_repair_for_reasons(item["status"], repair_reasons):
+                        final_text = enforce_line_count(
+                            item["status"]["candidate"],
+                            item["expected_line_count"],
+                        )
+                    else:
+                        if fast_mode:
+                            item["final_text"] = item["original_text_field"]
+                            history.append(item["final_text"].replace("\n", " ").strip())
+                            continue
+                        retried = retry_single_item_translation(
+                            client,
+                            item["original_text_field"],
+                            summary,
+                            tone_guide,
+                            target_lang,
+                            options,
+                            mode="srt_block",
+                        )
+                        if retried is not None:
+                            retry_status = scan_srt_candidate(item, retried, target_lang)
+                            if retry_status["ok"]:
+                                final_text = enforce_line_count(
+                                    retry_status["candidate"],
+                                    item["expected_line_count"],
+                                )
+                            else:
+                                final_text = item["original_text_field"]
                         else:
                             final_text = item["original_text_field"]
-                    else:
-                        final_text = item["original_text_field"]
-                item["final_text"] = final_text
-                history.append(final_text.replace("\n", " ").strip())
-            progress.advance(task_id, len(batch))
+                    item["final_text"] = final_text
+                    history.append(final_text.replace("\n", " ").strip())
+                progress.advance(task_id, len(work_batch))
 
     for item in items:
         block = blocks[item["block_idx"]]
@@ -2506,119 +2554,142 @@ def translate_ass(
         else {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
     )
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
+    active_batch_cap = ass_batch_cap
     history: List[str] = []
 
     with progress_bar(console) as progress:
         task_id = progress.add_task("Translation", total=len(translatable_items))
         for batch in batches:
-            RUNTIME_METRICS.bump("translate.top_level_batches", 1)
-            RUNTIME_METRICS.bump("translate.top_level_batch_items", len(batch))
-            sources = [item["protected_text"] for item in batch]
-            context_hint = rolling_context_snippet(history, rolling_context)
-            out = translate_json_batch_with_split(
-                client,
-                sources,
-                summary,
-                tone_guide,
-                target_lang,
-                options,
-                mode="ass_protected",
-                rolling_context=context_hint,
-                allow_partial=fast_mode,
-                max_split_depth=max_split_depth,
-            )
-            for item, candidate in zip(batch, out):
-                candidate_text = candidate if candidate is not None else item["protected_text"]
-                item["text_field"] = item["original_text_field"]
-                item["protected"] = item["protected_text"]
-                status = scan_ass_line_candidate(item, candidate_text, target_lang)
-                item["candidate"] = status["candidate"]
-                item["status"] = status
-                bump_status_reason_counters(status)
+            work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
+            for work_batch in work_batches:
+                RUNTIME_METRICS.bump("translate.top_level_batches", 1)
+                RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
+                sources = [item["protected_text"] for item in work_batch]
+                context_hint = rolling_context_snippet(history, rolling_context)
+                split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
+                out = translate_json_batch_with_split(
+                    client,
+                    sources,
+                    summary,
+                    tone_guide,
+                    target_lang,
+                    options,
+                    mode="ass_protected",
+                    rolling_context=context_hint,
+                    allow_partial=fast_mode,
+                    max_split_depth=max_split_depth,
+                )
+                for item, candidate in zip(work_batch, out):
+                    candidate_text = candidate if candidate is not None else item["protected_text"]
+                    item["text_field"] = item["original_text_field"]
+                    item["protected"] = item["protected_text"]
+                    status = scan_ass_line_candidate(item, candidate_text, target_lang)
+                    item["candidate"] = status["candidate"]
+                    item["status"] = status
+                    bump_status_reason_counters(status)
 
-            failed_items = [
-                item
-                for item in batch
-                if needs_llm_repair_for_reasons(item["status"], repair_reasons)
-            ]
-            repair_limit = max(8, int(math.ceil(0.10 * max(1, len(batch)))))
-            if fast_mode and failed_items:
-                failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
-            if failed_items:
-                if len(failed_items) > repair_limit:
-                    cprint(
-                        console,
-                        f"High fail-rate: {len(failed_items)}/{len(batch)} ASS flagged. Retrying batch @temp=0...",
-                        "yellow",
-                    )
-                if len(failed_items) > repair_limit or not fast_mode:
-                    retry_failed_items_batch(
+                failed_items = [
+                    item
+                    for item in work_batch
+                    if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                ]
+                split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
+                severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
+                if (
+                    not fast_mode
+                    and active_batch_cap > ADAPTIVE_BATCH_MIN_ITEMS
+                    and (split_after > split_before or severe_ratio >= 0.35)
+                ):
+                    new_cap = reduce_adaptive_batch_cap(active_batch_cap)
+                    if new_cap < active_batch_cap:
+                        cprint(
+                            console,
+                            (
+                                f"Adaptive batch cap: {active_batch_cap} -> {new_cap} "
+                                f"(split={split_after - split_before}, fail_rate={severe_ratio:.0%})"
+                            ),
+                            "yellow",
+                        )
+                        active_batch_cap = new_cap
+
+                repair_limit = max(8, int(math.ceil(0.10 * max(1, len(work_batch)))))
+                if fast_mode and failed_items:
+                    failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
+                if failed_items:
+                    if len(failed_items) > repair_limit:
+                        cprint(
+                            console,
+                            f"High fail-rate: {len(failed_items)}/{len(work_batch)} ASS flagged. Retrying batch @temp=0...",
+                            "yellow",
+                        )
+                    if len(failed_items) > repair_limit or not fast_mode:
+                        retry_failed_items_batch(
+                            client,
+                            failed_items,
+                            summary,
+                            tone_guide,
+                            target_lang,
+                            options,
+                            mode="ass_protected",
+                            format_mode="schema",
+                            allow_partial=fast_mode,
+                            max_split_depth=max_split_depth,
+                        )
+                        failed_items = [
+                            item
+                            for item in work_batch
+                            if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                        ]
+                        if fast_mode and failed_items:
+                            failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
+                if failed_items:
+                    run_ass_surgical_fallback(
                         client,
                         failed_items,
                         summary,
                         tone_guide,
                         target_lang,
                         options,
-                        mode="ass_protected",
-                        format_mode="schema",
-                        allow_partial=fast_mode,
-                        max_split_depth=max_split_depth,
+                        console,
+                        fast_mode=fast_mode,
+                        fast_budget=(fast_repair_budget(len(work_batch)) if fast_mode else None),
                     )
-                    failed_items = [
-                        item
-                        for item in batch
-                        if needs_llm_repair_for_reasons(item["status"], repair_reasons)
-                    ]
-                    if fast_mode and failed_items:
-                        failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(batch)))
-            if failed_items:
-                run_ass_surgical_fallback(
-                    client,
-                    failed_items,
-                    summary,
-                    tone_guide,
-                    target_lang,
-                    options,
-                    console,
-                    fast_mode=fast_mode,
-                    fast_budget=(fast_repair_budget(len(batch)) if fast_mode else None),
-                )
 
-            for item in batch:
-                status = item["status"]
-                if "forced_restored" in item:
-                    forced = item["forced_restored"]
-                    if ass_structure_preserved(item["original_text_field"], forced):
-                        final_text = forced
-                    else:
-                        final_text = item["original_text_field"]
-                elif status["ok"] or not needs_llm_repair_for_reasons(status, repair_reasons):
-                    final_text = status["restored"]
-                else:
-                    if fast_mode:
-                        item["final_text"] = item["original_text_field"]
-                        history.append(ass_plain_text(item["final_text"]).replace("\n", " ").strip())
-                        continue
-                    retried = retry_single_item_translation(
-                        client,
-                        item["protected_text"],
-                        summary,
-                        tone_guide,
-                        target_lang,
-                        options,
-                        mode="ass_protected",
-                    )
-                    if retried is not None:
-                        retry_status = scan_ass_line_candidate(item, retried, target_lang)
-                        if retry_status["ok"]:
-                            final_text = retry_status["restored"]
+                for item in work_batch:
+                    status = item["status"]
+                    if "forced_restored" in item:
+                        forced = item["forced_restored"]
+                        if ass_structure_preserved(item["original_text_field"], forced):
+                            final_text = forced
                         else:
                             final_text = item["original_text_field"]
+                    elif status["ok"] or not needs_llm_repair_for_reasons(status, repair_reasons):
+                        final_text = status["restored"]
                     else:
-                        final_text = item["original_text_field"]
-                item["final_text"] = final_text
-                history.append(ass_plain_text(final_text).replace("\n", " ").strip())
-            progress.advance(task_id, len(batch))
+                        if fast_mode:
+                            item["final_text"] = item["original_text_field"]
+                            history.append(ass_plain_text(item["final_text"]).replace("\n", " ").strip())
+                            continue
+                        retried = retry_single_item_translation(
+                            client,
+                            item["protected_text"],
+                            summary,
+                            tone_guide,
+                            target_lang,
+                            options,
+                            mode="ass_protected",
+                        )
+                        if retried is not None:
+                            retry_status = scan_ass_line_candidate(item, retried, target_lang)
+                            if retry_status["ok"]:
+                                final_text = retry_status["restored"]
+                            else:
+                                final_text = item["original_text_field"]
+                        else:
+                            final_text = item["original_text_field"]
+                    item["final_text"] = final_text
+                    history.append(ass_plain_text(final_text).replace("\n", " ").strip())
+                progress.advance(task_id, len(work_batch))
 
     for item in items:
         fields = item["fields"]

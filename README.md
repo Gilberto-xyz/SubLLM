@@ -74,6 +74,7 @@ El flujo de traduccion fue optimizado para reducir llamadas extra al modelo y me
 - Mejor manejo de respuestas JSON parciales para evitar reintentos costosos.
 - Control de profundidad de split de lotes para evitar explosiones de llamadas.
 - Presupuesto de reintentos en modo rapido (`--fast`) para priorizar velocidad.
+- Ajuste adaptativo nativo del tamano de lote cuando detecta splits/fallos altos, para estabilizar tiempos sin flags extra.
 - Resumen de metricas por archivo tambien en modo paralelo (`--parallel-files > 1`).
 
 En el resumen final veras, entre otros:
