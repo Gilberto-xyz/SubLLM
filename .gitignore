@@ -4,5 +4,5 @@
 # Permitir solo los archivos del repositorio que sí se deben sincronizar
 !.gitignore
 !README.md
-!translate_subs.py
-!GESTIONAR_subs_v1.py
+!traducir_subtitulos.py
+!gestionar_subtitulos.py

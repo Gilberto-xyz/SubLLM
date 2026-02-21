@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GESTIONAR_subs_v1.py
+gestionar_subtitulos.py
 Version 3.4 - 20-feb-2026
 
 - Usa SUBS_BULK como carpeta de trabajo para videos y subtitulos.

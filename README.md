@@ -8,8 +8,8 @@ Herramientas para trabajar subtitulos locales:
 
 ## Scripts incluidos
 
-- `translate_subs.py`: traduce subtitulos con contexto (resumen + guia de tono).
-- `GESTIONAR_subs_v1.py`: extrae y muxea subtitulos en `SUBS_BULK/`.
+- `traducir_subtitulos.py`: traduce subtitulos con contexto (resumen + guia de tono).
+- `gestionar_subtitulos.py`: extrae y muxea subtitulos en `SUBS_BULK/`.
 
 ## Requisitos
 
@@ -38,18 +38,18 @@ ollama list
 Modo interactivo (recomendado):
 
 ```bash
-python translate_subs.py --interactive
+python traducir_subtitulos.py --interactive
 ```
 
 Modo directo:
 
 ```bash
-python translate_subs.py --in "archivo.ass" --target Spanish --model gemma3:4b --fast
+python traducir_subtitulos.py --in "archivo.ass" --target Spanish --model gemma3:4b --fast
 ```
 
 Nota:
 
-- Si pasas solo nombre de archivo (sin ruta), `translate_subs.py` busca el input en `SUBS_BULK/`.
+- Si pasas solo nombre de archivo (sin ruta), `traducir_subtitulos.py` busca el input en `SUBS_BULK/`.
 - La salida por defecto tambien se guarda en `SUBS_BULK/`.
 
 Opciones utiles:
@@ -96,7 +96,7 @@ Si Ollama usa una sola GPU con memoria limitada:
 Ejemplo de lote recomendado:
 
 ```bash
-python translate_subs.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish --fast --one-shot --parallel-files 2
+python traducir_subtitulos.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish --fast --one-shot --parallel-files 2
 ```
 
 Salida por defecto:
@@ -109,13 +109,13 @@ Salida por defecto:
 Con videos y subtitulos dentro de `SUBS_BULK/`:
 
 ```bash
-python GESTIONAR_subs_v1.py
+python gestionar_subtitulos.py
 ```
 
 Modo semi-automatico para mux (sin preguntas de confirmacion extra en el flujo de mux):
 
 ```bash
-python GESTIONAR_subs_v1.py --si
+python gestionar_subtitulos.py --si
 ```
 
 El script:
@@ -134,9 +134,9 @@ El script:
 
 ## Flujo recomendado
 
-1. Ejecuta `GESTIONAR_subs_v1.py` para sacar subtitulos del video.
+1. Ejecuta `gestionar_subtitulos.py` para sacar subtitulos del video.
 2. Revisa el archivo extraido (`.ass` o `.srt`).
-3. Traduce con `translate_subs.py`.
+3. Traduce con `traducir_subtitulos.py`.
 4. Prueba el resultado en tu reproductor y ajusta parametros si hace falta.
 
 ## Notas de sincronizacion del repo
