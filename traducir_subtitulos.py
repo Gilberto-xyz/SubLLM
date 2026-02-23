@@ -40,6 +40,9 @@ except ImportError:
 
 ASS_TAG_RE = re.compile(r"(\{[^}]*\}|\\N|\\n|\\h)")
 ASS_STRIP_RE = re.compile(r"\{[^}]*\}")
+ASS_VECTOR_TAG_RE = re.compile(r"\\p([1-9]\d*)")
+ASS_DRAWING_LINE_RE = re.compile(r"^[mlbspnc\d\s\.,+\-]+$", flags=re.IGNORECASE)
+ASS_WORD_RE = re.compile(r"[A-Za-z']+")
 PLACEHOLDER_TOKEN_RE = re.compile(r"__TAG_\d+__")
 LEGACY_PLACEHOLDER_RE = re.compile(r"__ASS_TAG_\d+__")
 BROKEN_PLACEHOLDER_RE = re.compile(r"__TAG_(?!\d+__)")
@@ -51,6 +54,10 @@ LABEL_PREFIX_RE = re.compile(
 SPANISH_MARKER_RE = re.compile(r"[áéíóúñüÁÉÍÓÚÑÜ]")
 CREDITS_OVERRIDE_RE = re.compile(r"\bBrought to you by\s*\[[^\]]+\]", flags=re.IGNORECASE)
 SRT_WATERMARK_TOKEN_RE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_.-]{4,}")
+FILENAME_LANG_HINTS = (
+    ("English", re.compile(r"(?:^|[_.\-\s])(eng|english|ingles|ingl[eé]s)(?:$|[_.\-\s])", re.IGNORECASE)),
+    ("Spanish", re.compile(r"(?:^|[_.\-\s])(spa|spanish|espanol|español)(?:$|[_.\-\s])", re.IGNORECASE)),
+)
 HONORIFICS = {"mr", "mrs", "ms", "miss", "sir", "ma'am", "madam"}
 SUMMARY_MARKERS = (
     "summary",
@@ -88,6 +95,11 @@ FAST_SPLIT_MAX_DEPTH = 1
 FAST_REPAIR_RATIO = 0.04
 ADAPTIVE_BATCH_MIN_ITEMS = 8
 ADAPTIVE_BATCH_REDUCE_FACTOR = 0.75
+OLLAMA_RETRY_ATTEMPTS = 3
+OLLAMA_RETRY_BACKOFF_SECONDS = 1.0
+SUMMARY_MAX_CHUNKS = 10
+SUMMARY_MAX_LINES = 1200
+SUMMARY_DUP_LIMIT = 2
 T = TypeVar("T")
 FORMAT_MODE = "auto"
 MINIFY_JSON_PROMPTS = True
@@ -127,6 +139,23 @@ def cprint(console, text: str, style: str | None = None) -> None:
         console.print(f"[{style}]{text}[/]")
     else:
         console.print(text)
+
+
+def subtitle_type_label_and_style(path: Path) -> Tuple[str, str]:
+    ext = path.suffix.lower()
+    if ext == ".srt":
+        return "SRT", "bold green"
+    if ext == ".ass":
+        return "ASS", "bold cyan"
+    return ext.lstrip(".").upper() or "FILE", "white"
+
+
+def print_subtitle_option(console, idx: int, path: Path) -> None:
+    label, style = subtitle_type_label_and_style(path)
+    if RICH_AVAILABLE:
+        console.print(f"  {idx}) [{style}]{path.name}[/{style}] [dim]({label})[/dim]")
+    else:
+        console.print(f"  {idx}) {path.name} ({label})")
 
 
 def progress_bar(console):
@@ -363,22 +392,53 @@ class OllamaClient:
         elif isinstance(format, dict):
             format_name = "schema"
         started = time.perf_counter()
-        try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-        except socket.timeout as exc:
-            raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
-        except TimeoutError as exc:
-            raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
-        except error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
-        except error.URLError as exc:
-            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                raise OllamaTimeoutError(f"Ollama request timed out after {self.timeout}s") from exc
-            raise RuntimeError(
-                f"Cannot reach Ollama at {self.host}. Is it running?"
-            ) from exc
+        attempts = max(1, OLLAMA_RETRY_ATTEMPTS)
+        body = ""
+        last_exc = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with request.urlopen(req, timeout=self.timeout) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+                last_exc = None
+                break
+            except socket.timeout as exc:
+                last_exc = OllamaTimeoutError(
+                    f"Ollama request timed out after {self.timeout}s "
+                    f"(attempt {attempt}/{attempts})"
+                )
+            except TimeoutError as exc:
+                last_exc = OllamaTimeoutError(
+                    f"Ollama request timed out after {self.timeout}s "
+                    f"(attempt {attempt}/{attempts})"
+                )
+            except error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
+            except error.URLError as exc:
+                reason = exc.reason
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    last_exc = OllamaTimeoutError(
+                        f"Ollama request timed out after {self.timeout}s "
+                        f"(attempt {attempt}/{attempts})"
+                    )
+                elif isinstance(reason, ConnectionRefusedError):
+                    last_exc = RuntimeError(
+                        f"Cannot reach Ollama at {self.host} "
+                        f"(connection refused, attempt {attempt}/{attempts}). Is it running?"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Cannot reach Ollama at {self.host}. Is it running?"
+                    ) from exc
+            except ConnectionRefusedError as exc:
+                last_exc = RuntimeError(
+                    f"Cannot reach Ollama at {self.host} "
+                    f"(connection refused, attempt {attempt}/{attempts}). Is it running?"
+                )
+            if attempt < attempts:
+                time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * attempt)
+        if last_exc is not None:
+            raise last_exc
         elapsed = time.perf_counter() - started
         RUNTIME_METRICS.seconds["ollama.chat"] += elapsed
         RUNTIME_METRICS.calls["ollama.chat"] += 1
@@ -425,6 +485,57 @@ def build_chunks(lines: List[str], max_chars: int) -> List[str]:
     return chunks
 
 
+def evenly_sample_lines(lines: List[str], limit: int) -> List[str]:
+    if limit <= 0 or len(lines) <= limit:
+        return lines
+    if limit == 1:
+        return [lines[len(lines) // 2]]
+    step = (len(lines) - 1) / float(limit - 1)
+    out = []
+    last_idx = -1
+    for i in range(limit):
+        idx = int(round(i * step))
+        if idx <= last_idx:
+            idx = min(len(lines) - 1, last_idx + 1)
+        out.append(lines[idx])
+        last_idx = idx
+    return out
+
+
+def prepare_summary_lines(lines: List[str], max_chars: int) -> Tuple[List[str], int]:
+    cleaned = []
+    seen_counts: dict[str, int] = {}
+    for line in lines:
+        normalized = normalize_inline_text(line)
+        if not normalized:
+            continue
+        key = normalized.lower()
+        seen = seen_counts.get(key, 0)
+        if seen >= SUMMARY_DUP_LIMIT:
+            continue
+        seen_counts[key] = seen + 1
+        cleaned.append(normalized)
+    if not cleaned:
+        return [], 0
+
+    sampled = evenly_sample_lines(cleaned, SUMMARY_MAX_LINES)
+    max_total_chars = max(max_chars, max_chars * SUMMARY_MAX_CHUNKS)
+    total_chars = sum(len(line) + 1 for line in sampled)
+    if total_chars > max_total_chars:
+        target_lines = max(1, int(len(sampled) * (max_total_chars / float(total_chars))))
+        sampled = evenly_sample_lines(sampled, target_lines)
+        trimmed = []
+        running = 0
+        for line in sampled:
+            line_len = len(line) + 1
+            if trimmed and running + line_len > max_total_chars:
+                continue
+            trimmed.append(line)
+            running += line_len
+        sampled = trimmed or sampled[:1]
+    return sampled, len(cleaned)
+
+
 def summarize_subs(
     client: OllamaClient,
     lines: List[str],
@@ -434,8 +545,17 @@ def summarize_subs(
 ) -> str:
     if not lines:
         return ""
+    summary_lines, cleaned_count = prepare_summary_lines(lines, max_chars)
+    if not summary_lines:
+        return ""
+    if len(summary_lines) < cleaned_count:
+        cprint(
+            console,
+            f"Summary corpus reduced: {cleaned_count} -> {len(summary_lines)} line(s).",
+            "yellow",
+        )
     with RUNTIME_METRICS.timed("summary.total"):
-        chunks = build_chunks(lines, max_chars)
+        chunks = build_chunks(summary_lines, max_chars)
         RUNTIME_METRICS.bump("summary.chunks", len(chunks))
         summaries = []
         system_msg = (
@@ -1124,6 +1244,67 @@ def bump_status_reason_counters(status: dict) -> None:
 
 def should_translate(segment: str) -> bool:
     return bool(re.search(r"[A-Za-z]", segment))
+
+
+def normalize_inline_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\n", " ").strip())
+
+
+def is_ass_drawing_payload(text_field: str, plain_text: str) -> bool:
+    source = text_field or ""
+    if ASS_VECTOR_TAG_RE.search(source):
+        return True
+    normalized = normalize_inline_text(plain_text)
+    if not normalized:
+        return False
+    if ASS_DRAWING_LINE_RE.fullmatch(normalized):
+        return True
+    tokens = normalized.split()
+    if not tokens:
+        return False
+    draw_cmds = sum(1 for token in tokens if token.lower() in {"m", "l", "b", "s", "p", "n", "c"})
+    numeric = sum(1 for token in tokens if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token))
+    return draw_cmds >= 3 and numeric >= 2 and (draw_cmds + numeric) >= max(4, int(len(tokens) * 0.7))
+
+
+def looks_like_low_value_ass_fragment(plain_text: str) -> bool:
+    normalized = normalize_inline_text(plain_text)
+    if not normalized:
+        return True
+    words = ASS_WORD_RE.findall(normalized.lower())
+    if not words:
+        return True
+    letters = sum(len(word) for word in words)
+    if len(words) == 1 and letters <= 3:
+        return True
+    if len(words) <= 2 and letters <= 4:
+        return True
+    if len(set(words)) == 1 and len(words) >= 2 and len(words[0]) <= 3:
+        return True
+    return False
+
+
+def should_translate_ass_dialogue(text_field: str, effect: str = "", for_summary: bool = False) -> bool:
+    plain = ass_plain_text(text_field)
+    normalized = normalize_inline_text(plain)
+    if not normalized:
+        return False
+    if not should_translate(normalized):
+        return False
+    if is_ass_drawing_payload(text_field, normalized):
+        return False
+    words = ASS_WORD_RE.findall(normalized.lower())
+    effect_norm = (effect or "").strip().lower()
+    if effect_norm == "fx" and looks_like_low_value_ass_fragment(normalized):
+        return False
+    if for_summary:
+        if looks_like_low_value_ass_fragment(normalized):
+            return False
+        if effect_norm == "fx" and len(words) < 4:
+            return False
+        if len(normalized) < 6:
+            return False
+    return True
 
 
 def should_skip_srt_block_translation(text: str) -> bool:
@@ -1855,6 +2036,12 @@ def self_test_hybrid_pipeline() -> None:
     assert not srt_wrap_status["needs_llm_repair"]
     assert should_skip_srt_block_translation("Katmovie18")
     assert not should_skip_srt_block_translation("Whatever.")
+    assert not should_translate_ass_dialogue(r"{\an5\p1}m 0 -6 l -4.5 -1.5 l -4.5 3 l 0 7.5", effect="fx")
+    assert not should_translate_ass_dialogue(r"{\an5\pos(766.5,64.5)}da", effect="fx", for_summary=True)
+    assert should_translate_ass_dialogue(
+        "Word on the street is that policy changed right when the Council Chairman did.",
+        effect="",
+    )
     duplicate_batch = [
         {
             "original_text_field": "I saw him near the station yesterday.",
@@ -1937,6 +2124,7 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
     in_events = False
     format_fields = None
     text_idx = None
+    effect_idx = None
     items: List[dict] = []
     translated_count = 0
 
@@ -1950,6 +2138,7 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
             format_fields = [f.strip() for f in fmt.split(",")]
             if "Text" in format_fields:
                 text_idx = format_fields.index("Text")
+            effect_idx = format_fields.index("Effect") if "Effect" in format_fields else None
             continue
         if not in_events or format_fields is None or text_idx is None:
             continue
@@ -1969,7 +2158,8 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
             continue
 
         text_field = fields[text_idx]
-        if not should_translate(text_field):
+        effect = fields[effect_idx] if effect_idx is not None else ""
+        if not should_translate_ass_dialogue(text_field, effect=effect):
             continue
         fixed_final_text = None
         overridden_text = apply_phrase_overrides(text_field)
@@ -3052,6 +3242,7 @@ def collect_plain_lines_ass(text: str) -> List[str]:
     in_events = False
     format_fields = None
     text_idx = None
+    effect_idx = None
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("[Events]"):
@@ -3062,6 +3253,7 @@ def collect_plain_lines_ass(text: str) -> List[str]:
             format_fields = [f.strip() for f in fmt.split(",")]
             if "Text" in format_fields:
                 text_idx = format_fields.index("Text")
+            effect_idx = format_fields.index("Effect") if "Effect" in format_fields else None
             continue
         if not in_events or format_fields is None or text_idx is None:
             continue
@@ -3072,17 +3264,29 @@ def collect_plain_lines_ass(text: str) -> List[str]:
         if len(fields) != len(format_fields):
             continue
         text_field = fields[text_idx]
-        lines.append(ass_plain_text(text_field))
+        effect = fields[effect_idx] if effect_idx is not None else ""
+        if not should_translate_ass_dialogue(text_field, effect=effect, for_summary=True):
+            continue
+        lines.append(normalize_inline_text(ass_plain_text(text_field)))
     return lines
 
 
 def collect_plain_lines_srt(text: str) -> List[str]:
     lines = []
-    blocks = text.split("\n\n")
-    for block in blocks:
-        parts = block.splitlines()
-        if len(parts) >= 3:
-            lines.extend(parts[2:])
+    block = []
+    for line in text.splitlines():
+        if line.strip() == "":
+            if len(block) >= 3:
+                text_block = "\n".join(block[2:])
+                if not should_skip_srt_block_translation(text_block):
+                    lines.extend(block[2:])
+            block = []
+            continue
+        block.append(line)
+    if len(block) >= 3:
+        text_block = "\n".join(block[2:])
+        if not should_skip_srt_block_translation(text_block):
+            lines.extend(block[2:])
     return lines
 
 
@@ -3104,6 +3308,14 @@ def detect_language(text: str) -> Tuple[str, float]:
         lang = "Unknown"
     confidence = abs(en_count - es_count) / total
     return lang, confidence
+
+
+def detect_language_from_filename(path: Path) -> str | None:
+    name = path.stem
+    for lang, pattern in FILENAME_LANG_HINTS:
+        if pattern.search(name):
+            return lang
+    return None
 
 
 def bulk_dir() -> Path:
@@ -3321,14 +3533,12 @@ def collect_batch_inputs(raw_input: str | None, target_lang: str) -> List[Path]:
 
 
 def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int | None, bool, str]:
-    files = list_subtitle_files([".srt"])
-    if not files:
-        files = list_subtitle_files([".ass"])
+    files = list_subtitle_files([".srt", ".ass"])
     in_paths: List[Path] = []
     if files:
         cprint(console, "Subtitle files found:", "bold cyan")
         for i, f in enumerate(files, 1):
-            console.print(f"  {i}) {f.name}")
+            print_subtitle_option(console, i, f)
         raw = input("Select file number(s) (e.g. 1 3 5, 1-4) or type a path (or 'all'): ").strip()
 
         idxs = _parse_index_selection(raw, len(files))
@@ -3366,12 +3576,22 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     else:
         sample_lines = collect_plain_lines_srt(text)
 
+    preview_pool = sample_lines
+    if len(sample_lines) > 80:
+        sampled_preview, _ = prepare_summary_lines(sample_lines, 6000)
+        if sampled_preview:
+            preview_pool = sampled_preview
+
     cprint(console, "\nSample (first 8 lines):", "bold cyan")
-    for line in sample_lines[:8]:
+    for line in preview_pool[:8]:
         console.print(f"  {line}")
 
-    sample_blob = "\n".join(sample_lines[:50])
+    sample_blob = "\n".join(preview_pool[:50])
     detected, confidence = detect_language(sample_blob)
+    hint_lang = detect_language_from_filename(sample_path)
+    if hint_lang and (detected == "Unknown" or confidence < 0.35):
+        detected = hint_lang
+        confidence = max(confidence, 0.55)
     conf_pct = int(confidence * 100)
     cprint(
         console,
