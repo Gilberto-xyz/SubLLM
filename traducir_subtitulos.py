@@ -100,6 +100,12 @@ OLLAMA_RETRY_BACKOFF_SECONDS = 1.0
 SUMMARY_MAX_CHUNKS = 10
 SUMMARY_MAX_LINES = 1200
 SUMMARY_DUP_LIMIT = 2
+SRT_REPAIR_REASONS = {"empty_output", "label_prefix", "unchanged", "language_leak", "very_suspicious"}
+SRT_LINEWISE_REPAIR_REASONS = {"empty_output", "label_prefix", "language_leak", "very_suspicious"}
+SRT_ADAPTIVE_REDUCE_FAIL_RATE = 0.35
+SRT_ADAPTIVE_REDUCE_SPLIT_FAIL_RATE = 0.15
+ASS_ADAPTIVE_REDUCE_FAIL_RATE = 0.35
+ASS_ADAPTIVE_REDUCE_SPLIT_FAIL_RATE = 0.15
 T = TypeVar("T")
 FORMAT_MODE = "auto"
 MINIFY_JSON_PROMPTS = True
@@ -1669,7 +1675,10 @@ def translate_json_batch(
     if selected_format_mode == "schema":
         request_format = schema
     elif selected_format_mode == "auto" and (
-        force_temperature_zero or len(texts) <= 2 or AUTO_JSON_DISABLED or mode == "ass_protected"
+        force_temperature_zero
+        or len(texts) <= 2
+        or AUTO_JSON_DISABLED
+        or mode in {"ass_protected", "srt_block"}
     ):
         request_format = schema
     else:
@@ -2050,6 +2059,14 @@ def self_test_hybrid_pipeline() -> None:
     leaders, groups = dedupe_ass_translation_items(dedupe_input)
     assert len(leaders) == 2
     assert len(groups["__TAG_0__Warning"]) == 2
+    srt_dedupe_input = [
+        {"protected_text": "Hello there", "expected_line_count": 1},
+        {"protected_text": "Hello there", "expected_line_count": 1},
+        {"protected_text": "Hello there", "expected_line_count": 2},
+    ]
+    srt_leaders, srt_groups = dedupe_srt_translation_items(srt_dedupe_input)
+    assert len(srt_leaders) == 2
+    assert len(srt_groups[("Hello there", 1)]) == 2
     duplicate_batch = [
         {
             "original_text_field": "I saw him near the station yesterday.",
@@ -2070,7 +2087,7 @@ def self_test_hybrid_pipeline() -> None:
     ]
     mark_duplicate_srt_batch_outputs(duplicate_batch)
     assert "duplicate_output" in duplicate_batch[1]["status"]["reasons"]
-    assert duplicate_batch[1]["status"]["needs_llm_repair"]
+    assert not duplicate_batch[1]["status"]["needs_llm_repair"]
     duplicate_window_batch = [
         {
             "original_text_field": "Keep the back gate locked tonight.",
@@ -2105,14 +2122,14 @@ def self_test_hybrid_pipeline() -> None:
         "Spanish",
     )
     assert "short_line_overflow" in overflow_status["reasons"]
-    assert overflow_status["needs_llm_repair"]
+    assert not overflow_status["needs_llm_repair"]
     length_status = scan_srt_candidate(
         {"original_text_field": "it is not in academics.", "expected_line_count": 1},
         "Aun esta descubriendo en que area puede destacar realmente frente a los demas.",
         "Spanish",
     )
     assert "length_mismatch" in length_status["reasons"]
-    assert length_status["needs_llm_repair"]
+    assert not length_status["needs_llm_repair"]
     miss_src = "Miss Ito,"
     miss_protected, miss_repl = ass_protect_tags(miss_src)
     miss_state = {
@@ -2202,6 +2219,21 @@ def dedupe_ass_translation_items(items: List[dict]) -> Tuple[List[dict], dict[st
     order: List[str] = []
     for item in items:
         key = item.get("protected_text", "")
+        bucket = groups.get(key)
+        if bucket is None:
+            groups[key] = [item]
+            order.append(key)
+        else:
+            bucket.append(item)
+    leaders = [groups[key][0] for key in order]
+    return leaders, groups
+
+
+def dedupe_srt_translation_items(items: List[dict]) -> Tuple[List[dict], dict[Tuple[str, int], List[dict]]]:
+    groups: dict[Tuple[str, int], List[dict]] = {}
+    order: List[Tuple[str, int]] = []
+    for item in items:
+        key = (item.get("protected_text", ""), int(item.get("expected_line_count", 1)))
         bucket = groups.get(key)
         if bucket is None:
             groups[key] = [item]
@@ -2304,7 +2336,7 @@ def mark_duplicate_srt_batch_outputs(items: List[dict]) -> None:
                             reasons.append("duplicate_output")
                             status["reasons"] = reasons
                             status["ok"] = False
-                            status["needs_llm_repair"] = True
+                            status["needs_llm_repair"] = False
                             status["score"] = repair_issue_score(reasons)
                         break
         recent.append((candidate, source))
@@ -2344,16 +2376,7 @@ def scan_srt_candidate(item: dict, candidate: str, target_lang: str) -> dict:
     # For SRT we can safely normalize line wraps later with enforce_line_count().
     # Treat line break drift as non-fatal to avoid expensive false-positive retries.
     needs_repair = any(
-        reason
-        in {
-            "empty_output",
-            "label_prefix",
-            "unchanged",
-            "language_leak",
-            "very_suspicious",
-            "short_line_overflow",
-            "length_mismatch",
-        }
+        reason in SRT_REPAIR_REASONS
         for reason in reasons
     )
     return {
@@ -2707,28 +2730,25 @@ def translate_srt(
     for item in items:
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
+    deduped_items, dedupe_groups = dedupe_srt_translation_items(translatable_items)
+    if len(deduped_items) < len(translatable_items):
+        saved = len(translatable_items) - len(deduped_items)
+        cprint(
+            console,
+            f"SRT dedupe: {len(translatable_items)} -> {len(deduped_items)} unique block(s) (saved {saved} LLM items).",
+            "yellow",
+        )
+        RUNTIME_METRICS.bump("srt.dedupe.saved_items", saved)
+        RUNTIME_METRICS.bump("srt.dedupe.groups", len(dedupe_groups))
 
-    repair_reasons = (
-        {"empty_output", "label_prefix", "unchanged"}
-        if fast_mode
-        else {
-            "empty_output",
-            "label_prefix",
-            "unchanged",
-            "language_leak",
-            "very_suspicious",
-            "duplicate_output",
-            "short_line_overflow",
-            "length_mismatch",
-        }
-    )
+    repair_reasons = {"empty_output", "label_prefix", "unchanged"} if fast_mode else set(SRT_REPAIR_REASONS)
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
-    batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
+    batches = build_adaptive_batches(deduped_items, ass_batch_cap, options, one_shot, console)
     active_batch_cap = ass_batch_cap
     history: List[str] = []
     with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(translatable_items))
+        task_id = progress.add_task("Translation", total=len(deduped_items))
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
@@ -2767,7 +2787,13 @@ def translate_srt(
                 if (
                     not fast_mode
                     and active_batch_cap > ADAPTIVE_BATCH_MIN_ITEMS
-                    and (split_after > split_before or severe_ratio >= 0.35)
+                    and (
+                        severe_ratio >= SRT_ADAPTIVE_REDUCE_FAIL_RATE
+                        or (
+                            split_after > split_before
+                            and severe_ratio >= SRT_ADAPTIVE_REDUCE_SPLIT_FAIL_RATE
+                        )
+                    )
                 ):
                     new_cap = reduce_adaptive_batch_cap(active_batch_cap)
                     if new_cap < active_batch_cap:
@@ -2809,7 +2835,12 @@ def translate_srt(
                     if fast_mode and failed_items:
                         failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
                 if failed_items and not fast_mode:
-                    for item in failed_items:
+                    linewise_items = [
+                        item
+                        for item in failed_items
+                        if needs_llm_repair_for_reasons(item["status"], SRT_LINEWISE_REPAIR_REASONS)
+                    ]
+                    for item in linewise_items:
                         repaired = fallback_srt_linewise(
                             client,
                             item,
@@ -2857,6 +2888,17 @@ def translate_srt(
                     item["final_text"] = final_text
                     history.append(final_text.replace("\n", " ").strip())
                 progress.advance(task_id, len(work_batch))
+
+    if dedupe_groups:
+        for grouped_items in dedupe_groups.values():
+            if len(grouped_items) <= 1:
+                continue
+            leader = grouped_items[0]
+            leader_final = leader.get("final_text")
+            for clone in grouped_items[1:]:
+                if clone.get("final_text"):
+                    continue
+                clone["final_text"] = leader_final if leader_final is not None else clone["original_text_field"]
 
     for item in items:
         block = blocks[item["block_idx"]]
@@ -2970,7 +3012,13 @@ def translate_ass(
                 if (
                     not fast_mode
                     and active_batch_cap > ADAPTIVE_BATCH_MIN_ITEMS
-                    and (split_after > split_before or severe_ratio >= 0.35)
+                    and (
+                        severe_ratio >= ASS_ADAPTIVE_REDUCE_FAIL_RATE
+                        or (
+                            split_after > split_before
+                            and severe_ratio >= ASS_ADAPTIVE_REDUCE_SPLIT_FAIL_RATE
+                        )
+                    )
                 ):
                     new_cap = reduce_adaptive_batch_cap(active_batch_cap)
                     if new_cap < active_batch_cap:
