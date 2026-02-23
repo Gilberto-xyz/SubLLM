@@ -2042,6 +2042,14 @@ def self_test_hybrid_pipeline() -> None:
         "Word on the street is that policy changed right when the Council Chairman did.",
         effect="",
     )
+    dedupe_input = [
+        {"protected_text": "__TAG_0__Warning"},
+        {"protected_text": "__TAG_0__Warning"},
+        {"protected_text": "__TAG_0__Underground Student Council"},
+    ]
+    leaders, groups = dedupe_ass_translation_items(dedupe_input)
+    assert len(leaders) == 2
+    assert len(groups["__TAG_0__Warning"]) == 2
     duplicate_batch = [
         {
             "original_text_field": "I saw him near the station yesterday.",
@@ -2187,6 +2195,21 @@ def parse_ass_ir(text: str, limit: int | None) -> Tuple[List[str], List[dict]]:
         items.append(item)
         translated_count += 1
     return lines, items
+
+
+def dedupe_ass_translation_items(items: List[dict]) -> Tuple[List[dict], dict[str, List[dict]]]:
+    groups: dict[str, List[dict]] = {}
+    order: List[str] = []
+    for item in items:
+        key = item.get("protected_text", "")
+        bucket = groups.get(key)
+        if bucket is None:
+            groups[key] = [item]
+            order.append(key)
+        else:
+            bucket.append(item)
+    leaders = [groups[key][0] for key in order]
+    return leaders, groups
 
 
 def parse_srt_ir(text: str, limit: int | None) -> Tuple[List[List[str]], List[dict]]:
@@ -2884,9 +2907,19 @@ def translate_ass(
     for item in items:
         if item.get("fixed_final_text"):
             item["final_text"] = item["fixed_final_text"]
+    deduped_items, dedupe_groups = dedupe_ass_translation_items(translatable_items)
+    if len(deduped_items) < len(translatable_items):
+        saved = len(translatable_items) - len(deduped_items)
+        cprint(
+            console,
+            f"ASS dedupe: {len(translatable_items)} -> {len(deduped_items)} unique line(s) (saved {saved} LLM items).",
+            "yellow",
+        )
+        RUNTIME_METRICS.bump("ass.dedupe.saved_items", saved)
+        RUNTIME_METRICS.bump("ass.dedupe.groups", len(dedupe_groups))
 
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
-    batches = build_adaptive_batches(translatable_items, ass_batch_cap, options, one_shot, console)
+    batches = build_adaptive_batches(deduped_items, ass_batch_cap, options, one_shot, console)
     repair_reasons = (
         {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
         if fast_mode
@@ -2897,7 +2930,7 @@ def translate_ass(
     history: List[str] = []
 
     with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(translatable_items))
+        task_id = progress.add_task("Translation", total=len(deduped_items))
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
@@ -3029,6 +3062,31 @@ def translate_ass(
                     item["final_text"] = final_text
                     history.append(ass_plain_text(final_text).replace("\n", " ").strip())
                 progress.advance(task_id, len(work_batch))
+
+    if dedupe_groups:
+        for grouped_items in dedupe_groups.values():
+            if len(grouped_items) <= 1:
+                continue
+            leader = grouped_items[0]
+            leader_status = leader.get("status")
+            leader_candidate = leader.get("candidate")
+            if leader_candidate is None and isinstance(leader_status, dict):
+                leader_candidate = leader_status.get("candidate")
+            for clone in grouped_items[1:]:
+                if clone.get("final_text"):
+                    continue
+                if leader_candidate is None:
+                    clone["final_text"] = clone["original_text_field"]
+                    continue
+                clone["text_field"] = clone["original_text_field"]
+                clone["protected"] = clone["protected_text"]
+                clone_status = scan_ass_line_candidate(clone, leader_candidate, target_lang)
+                clone["candidate"] = clone_status["candidate"]
+                clone["status"] = clone_status
+                if clone_status["ok"] or not needs_llm_repair_for_reasons(clone_status, repair_reasons):
+                    clone["final_text"] = clone_status["restored"]
+                else:
+                    clone["final_text"] = clone["original_text_field"]
 
     for item in items:
         fields = item["fields"]
