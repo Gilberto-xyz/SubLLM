@@ -8,7 +8,7 @@ Workflow:
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import fnmatch
@@ -88,8 +88,8 @@ DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
 DEFAULT_OUT_FRACTION = 0.60    # si num_predict no viene definido, reservar ~60% ctx para output
-TRANSLATION_SUMMARY_MAX = 600
-TRANSLATION_TONE_MAX = 400
+TRANSLATION_SUMMARY_MAX = 320
+TRANSLATION_TONE_MAX = 180
 ROLLING_CONTEXT_MAX_CHARS = 600
 FAST_SPLIT_MAX_DEPTH = 1
 FAST_REPAIR_RATIO = 0.04
@@ -113,6 +113,13 @@ BENCH_MODE = False
 AUTO_JSON_DISABLED = False
 AUTO_JSON_ATTEMPTS = 0
 AUTO_JSON_FAILS = 0
+BATCH_TRANSLATION_CACHE_MAX = 200000
+BATCH_TRANSLATION_CACHE = OrderedDict()
+EN_SIGNAL_TOKENS = {
+    "thanks", "sorry", "please", "yes", "no", "hello", "hi", "bye", "goodbye", "good", "bad",
+    "okay", "ok", "yeah", "yep", "nope", "love", "hate", "help", "wait", "stop", "go", "come",
+    "look", "listen", "right", "left", "damn", "shit", "fuck", "mom", "dad", "bro", "sis",
+}
 
 
 class SimpleConsole:
@@ -177,6 +184,126 @@ def progress_bar(console):
     return DummyProgress()
 
 
+class GlobalProgressTracker:
+    STAGE_LABELS = {
+        "summary": "Resumen",
+        "tone_guide": "Guia de tono",
+        "translate": "Traduccion",
+    }
+
+    def __init__(self, console, total_files: int, skipped: int = 0) -> None:
+        self.console = console
+        self.total_files = max(1, int(total_files or 1))
+        self.ok = 0
+        self.skipped = max(0, int(skipped or 0))
+        self.failed = 0
+        self._enabled = bool(RICH_AVAILABLE)
+        self._progress = None
+        self._global_task_id = None
+        self._file_task_id = None
+        self._stage_task_id = None
+        self._stage_total = 1
+        self._stage_completed = 0
+
+    def __enter__(self):
+        if not self._enabled:
+            return self
+        self._progress = Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+            transient=False,
+        )
+        self._progress.start()
+        initial_done = min(self.total_files, self.skipped)
+        self._global_task_id = self._progress.add_task(
+            self._global_desc(),
+            total=self.total_files,
+            completed=initial_done,
+        )
+        self._file_task_id = self._progress.add_task("Archivo: esperando...", total=1, completed=0)
+        self._stage_task_id = self._progress.add_task("Etapa: esperando...", total=1, completed=0)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._progress is not None:
+            self._progress.stop()
+        return False
+
+    def _global_desc(self) -> str:
+        return f"Global | ok={self.ok}, skipped={self.skipped}, failed={self.failed}"
+
+    def _is_ready(self) -> bool:
+        return bool(self._enabled and self._progress is not None)
+
+    def start_file(self, file_path: Path, file_index: int, total_files: int, include_summary: bool) -> None:
+        if not self._is_ready():
+            return
+        steps_total = 3 if include_summary else 1
+        name = file_path.name
+        if len(name) > 80:
+            name = name[:77] + "..."
+        self._progress.update(
+            self._file_task_id,
+            description=f"Archivo {file_index}/{total_files}: {name}",
+            total=steps_total,
+            completed=0,
+        )
+        self._progress.update(
+            self._stage_task_id,
+            description="Etapa: iniciando...",
+            total=1,
+            completed=0,
+        )
+        self._stage_total = 1
+        self._stage_completed = 0
+
+    def stage_start(self, stage_key: str, total: int) -> None:
+        if not self._is_ready():
+            return
+        label = self.STAGE_LABELS.get(stage_key, stage_key)
+        self._progress.update(
+            self._stage_task_id,
+            description=f"Etapa: {label}",
+            total=max(1, int(total or 1)),
+            completed=0,
+        )
+        self._stage_total = max(1, int(total or 1))
+        self._stage_completed = 0
+
+    def stage_advance(self, amount: int = 1) -> None:
+        if not self._is_ready():
+            return
+        safe_amount = max(0, int(amount))
+        self._stage_completed = min(self._stage_total, self._stage_completed + safe_amount)
+        self._progress.update(self._stage_task_id, completed=self._stage_completed)
+
+    def stage_done(self) -> None:
+        if not self._is_ready():
+            return
+        if self._stage_completed < self._stage_total:
+            self._progress.update(self._stage_task_id, completed=self._stage_total)
+            self._stage_completed = self._stage_total
+        self._progress.advance(self._file_task_id, 1)
+
+    def set_counts(self, ok: int, skipped: int, failed: int) -> None:
+        self.ok = max(0, int(ok))
+        self.skipped = max(0, int(skipped))
+        self.failed = max(0, int(failed))
+        if not self._is_ready():
+            return
+        done = min(self.total_files, self.ok + self.skipped + self.failed)
+        self._progress.update(
+            self._global_task_id,
+            description=self._global_desc(),
+            completed=done,
+        )
+
+
 class RuntimeMetrics:
     def __init__(self) -> None:
         self.seconds = defaultdict(float)
@@ -226,6 +353,31 @@ def resolve_format_mode(mode: str | None = None) -> str:
     if selected not in {"auto", "json", "schema"}:
         return "auto"
     return selected
+
+
+def translation_cache_key(
+    mode: str,
+    target_lang: str,
+    source: str,
+    variant: int = 0,
+) -> Tuple[str, str, int, str]:
+    return (mode, normalize_target_lang(target_lang), int(variant or 0), source or "")
+
+
+def translation_cache_get(key: Tuple[str, str, int, str]) -> str | None:
+    value = BATCH_TRANSLATION_CACHE.get(key)
+    if value is not None:
+        BATCH_TRANSLATION_CACHE.move_to_end(key)
+    return value
+
+
+def translation_cache_put(key: Tuple[str, str, int, str], translated: str) -> None:
+    if not translated:
+        return
+    BATCH_TRANSLATION_CACHE[key] = translated
+    BATCH_TRANSLATION_CACHE.move_to_end(key)
+    if len(BATCH_TRANSLATION_CACHE) > BATCH_TRANSLATION_CACHE_MAX:
+        BATCH_TRANSLATION_CACHE.popitem(last=False)
 
 
 def dump_json(data: Any, *, minify: bool | None = None) -> str:
@@ -300,6 +452,17 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         cprint(
             console,
             f"Batch stats: calls={batch_calls}, avg_items={avg_items:.1f}, avg_input_chars={avg_chars:.0f}",
+            "cyan",
+        )
+    cache_hits = RUNTIME_METRICS.counters.get("translate.cache.hits", 0)
+    cache_misses = RUNTIME_METRICS.counters.get("translate.cache.misses", 0)
+    cache_writes = RUNTIME_METRICS.counters.get("translate.cache.writes", 0)
+    cache_lookups = cache_hits + cache_misses
+    if cache_lookups:
+        hit_rate = (cache_hits / float(cache_lookups)) * 100.0
+        cprint(
+            console,
+            f"Translation cache: hits={cache_hits}, misses={cache_misses}, writes={cache_writes}, hit_rate={hit_rate:.1f}%",
             "cyan",
         )
     schema_retries = RUNTIME_METRICS.counters.get("format.schema_retry.attempts", 0)
@@ -548,11 +711,20 @@ def summarize_subs(
     max_chars: int,
     options,
     console,
+    progress_tracker: GlobalProgressTracker | None = None,
 ) -> str:
+    if progress_tracker is not None:
+        progress_tracker.stage_start("summary", 1)
     if not lines:
+        if progress_tracker is not None:
+            progress_tracker.stage_advance(1)
+            progress_tracker.stage_done()
         return ""
     summary_lines, cleaned_count = prepare_summary_lines(lines, max_chars)
     if not summary_lines:
+        if progress_tracker is not None:
+            progress_tracker.stage_advance(1)
+            progress_tracker.stage_done()
         return ""
     if len(summary_lines) < cleaned_count:
         cprint(
@@ -568,8 +740,10 @@ def summarize_subs(
             "You summarize subtitles. Write a concise summary in Spanish. "
             "Keep it short and factual."
         )
-        with progress_bar(console) as progress:
-            task_id = progress.add_task("Summary", total=len(chunks))
+        merge_units = 1 if len(chunks) > 1 else 0
+        total_units = len(chunks) + merge_units
+        if progress_tracker is not None:
+            progress_tracker.stage_start("summary", total_units)
             for chunk in chunks:
                 user_msg = (
                     "Summarize the following subtitle text in Spanish. "
@@ -584,21 +758,45 @@ def summarize_subs(
                         options=options,
                     )
                 summaries.append(content.strip())
-                progress.advance(task_id, 1)
+                progress_tracker.stage_advance(1)
+        else:
+            with progress_bar(console) as progress:
+                task_id = progress.add_task("Summary", total=len(chunks))
+                for chunk in chunks:
+                    user_msg = (
+                        "Summarize the following subtitle text in Spanish. "
+                        "Keep it short (6-8 sentences max).\n\n" + chunk
+                    )
+                    with RUNTIME_METRICS.timed("summary.chat.chunk"):
+                        content = client.chat(
+                            [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            options=options,
+                        )
+                    summaries.append(content.strip())
+                    progress.advance(task_id, 1)
         if len(summaries) == 1:
+            if progress_tracker is not None:
+                progress_tracker.stage_done()
             return summaries[0]
         user_msg = (
             "Combine these partial summaries into a single short summary in Spanish. "
             "Avoid repetition.\n\n" + "\n\n".join(summaries)
         )
         with RUNTIME_METRICS.timed("summary.chat.merge"):
-            return client.chat(
+            merged = client.chat(
                 [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 options=options,
             ).strip()
+        if progress_tracker is not None:
+            progress_tracker.stage_advance(1)
+            progress_tracker.stage_done()
+        return merged
 
 
 def build_tone_guide(
@@ -607,8 +805,14 @@ def build_tone_guide(
     sample_lines: List[str],
     options,
     console,
+    progress_tracker: GlobalProgressTracker | None = None,
 ) -> str:
+    if progress_tracker is not None:
+        progress_tracker.stage_start("tone_guide", 1)
     if not summary:
+        if progress_tracker is not None:
+            progress_tracker.stage_advance(1)
+            progress_tracker.stage_done()
         return ""
     sample = "\n".join(sample_lines[:80])
     system_msg = (
@@ -631,6 +835,9 @@ def build_tone_guide(
                 ],
                 options=options,
             )
+    if progress_tracker is not None:
+        progress_tracker.stage_advance(1)
+        progress_tracker.stage_done()
     data = extract_json_object(content)
     if not data:
         guide = content.strip()
@@ -802,11 +1009,8 @@ def is_unchanged_english(source_plain: str, translated_plain: str, target_lang: 
         return True
     if any(token in HONORIFICS for token in tokens):
         return True
-    if len(tokens) >= 3:
-        has_spanish_markers = bool(SPANISH_MARKER_RE.search(dst))
-        es_hits = sum(1 for token in ascii_word_tokens(dst) if token in ES_STOPWORDS)
-        if not has_spanish_markers and es_hits == 0:
-            return True
+    if any(token in EN_SIGNAL_TOKENS for token in tokens):
+        return True
     return False
 
 
@@ -2721,6 +2925,7 @@ def translate_srt(
     one_shot: bool = False,
     rolling_context: int = 0,
     fast_mode: bool = False,
+    progress_tracker: GlobalProgressTracker | None = None,
 ) -> Tuple[str, int]:
     blocks, items = parse_srt_ir(text, limit)
     if not items:
@@ -2747,29 +2952,53 @@ def translate_srt(
     batches = build_adaptive_batches(deduped_items, ass_batch_cap, options, one_shot, console)
     active_batch_cap = ass_batch_cap
     history: List[str] = []
-    with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(deduped_items))
+    progress_ctx = DummyProgress() if progress_tracker is not None else progress_bar(console)
+    if progress_tracker is not None:
+        progress_tracker.stage_start("translate", max(1, len(deduped_items)))
+    with progress_ctx as progress:
+        task_id = progress.add_task("Translation", total=len(deduped_items)) if progress_tracker is None else 0
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
                 RUNTIME_METRICS.bump("translate.top_level_batches", 1)
                 RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
-                sources = [item["protected_text"] for item in work_batch]
-                context_hint = rolling_context_snippet(history, rolling_context)
                 split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
-                out = translate_json_batch_with_split(
-                    client,
-                    sources,
-                    summary,
-                    tone_guide,
-                    target_lang,
-                    options,
-                    mode="srt_block",
-                    rolling_context=context_hint,
-                    allow_partial=fast_mode,
-                    max_split_depth=max_split_depth,
-                )
-                for item, candidate in zip(work_batch, out):
+                by_item_id: dict[int, str | None] = {}
+                uncached_items: List[dict] = []
+                uncached_sources: List[str] = []
+                for item in work_batch:
+                    cache_key = translation_cache_key(
+                        "srt_block",
+                        target_lang,
+                        item["protected_text"],
+                        item.get("expected_line_count", 1),
+                    )
+                    cached = translation_cache_get(cache_key)
+                    if cached is not None:
+                        by_item_id[id(item)] = cached
+                        RUNTIME_METRICS.bump("translate.cache.hits")
+                        continue
+                    uncached_items.append(item)
+                    uncached_sources.append(item["protected_text"])
+                    RUNTIME_METRICS.bump("translate.cache.misses")
+                if uncached_sources:
+                    context_hint = rolling_context_snippet(history, rolling_context)
+                    out = translate_json_batch_with_split(
+                        client,
+                        uncached_sources,
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        mode="srt_block",
+                        rolling_context=context_hint,
+                        allow_partial=fast_mode,
+                        max_split_depth=max_split_depth,
+                    )
+                    for item, candidate in zip(uncached_items, out):
+                        by_item_id[id(item)] = candidate
+                for item in work_batch:
+                    candidate = by_item_id.get(id(item))
                     status = scan_srt_candidate(item, candidate or "", target_lang)
                     item["candidate"] = status["candidate"]
                     item["status"] = status
@@ -2886,8 +3115,22 @@ def translate_srt(
                         else:
                             final_text = item["original_text_field"]
                     item["final_text"] = final_text
+                    if final_text and final_text != item["original_text_field"]:
+                        cache_key = translation_cache_key(
+                            "srt_block",
+                            target_lang,
+                            item["protected_text"],
+                            item.get("expected_line_count", 1),
+                        )
+                        translation_cache_put(cache_key, final_text)
+                        RUNTIME_METRICS.bump("translate.cache.writes")
                     history.append(final_text.replace("\n", " ").strip())
-                progress.advance(task_id, len(work_batch))
+                if progress_tracker is not None:
+                    progress_tracker.stage_advance(len(work_batch))
+                else:
+                    progress.advance(task_id, len(work_batch))
+    if progress_tracker is not None:
+        progress_tracker.stage_done()
 
     if dedupe_groups:
         for grouped_items in dedupe_groups.values():
@@ -2928,6 +3171,7 @@ def translate_ass(
     one_shot: bool = False,
     rolling_context: int = 0,
     fast_mode: bool = False,
+    progress_tracker: GlobalProgressTracker | None = None,
 ) -> Tuple[str, int]:
     if ass_mode == "segment":
         return translate_ass_segment(
@@ -2971,29 +3215,48 @@ def translate_ass(
     active_batch_cap = ass_batch_cap
     history: List[str] = []
 
-    with progress_bar(console) as progress:
-        task_id = progress.add_task("Translation", total=len(deduped_items))
+    progress_ctx = DummyProgress() if progress_tracker is not None else progress_bar(console)
+    if progress_tracker is not None:
+        progress_tracker.stage_start("translate", max(1, len(deduped_items)))
+    with progress_ctx as progress:
+        task_id = progress.add_task("Translation", total=len(deduped_items)) if progress_tracker is None else 0
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
                 RUNTIME_METRICS.bump("translate.top_level_batches", 1)
                 RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
-                sources = [item["protected_text"] for item in work_batch]
-                context_hint = rolling_context_snippet(history, rolling_context)
                 split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
-                out = translate_json_batch_with_split(
-                    client,
-                    sources,
-                    summary,
-                    tone_guide,
-                    target_lang,
-                    options,
-                    mode="ass_protected",
-                    rolling_context=context_hint,
-                    allow_partial=fast_mode,
-                    max_split_depth=max_split_depth,
-                )
-                for item, candidate in zip(work_batch, out):
+                by_item_id: dict[int, str | None] = {}
+                uncached_items: List[dict] = []
+                uncached_sources: List[str] = []
+                for item in work_batch:
+                    cache_key = translation_cache_key("ass_protected", target_lang, item["protected_text"])
+                    cached = translation_cache_get(cache_key)
+                    if cached is not None:
+                        by_item_id[id(item)] = cached
+                        RUNTIME_METRICS.bump("translate.cache.hits")
+                        continue
+                    uncached_items.append(item)
+                    uncached_sources.append(item["protected_text"])
+                    RUNTIME_METRICS.bump("translate.cache.misses")
+                if uncached_sources:
+                    context_hint = rolling_context_snippet(history, rolling_context)
+                    out = translate_json_batch_with_split(
+                        client,
+                        uncached_sources,
+                        summary,
+                        tone_guide,
+                        target_lang,
+                        options,
+                        mode="ass_protected",
+                        rolling_context=context_hint,
+                        allow_partial=fast_mode,
+                        max_split_depth=max_split_depth,
+                    )
+                    for item, candidate in zip(uncached_items, out):
+                        by_item_id[id(item)] = candidate
+                for item in work_batch:
+                    candidate = by_item_id.get(id(item))
                     candidate_text = candidate if candidate is not None else item["protected_text"]
                     item["text_field"] = item["original_text_field"]
                     item["protected"] = item["protected_text"]
@@ -3108,8 +3371,19 @@ def translate_ass(
                         else:
                             final_text = item["original_text_field"]
                     item["final_text"] = final_text
+                    if final_text and final_text != item["original_text_field"]:
+                        protected_final, _ = ass_protect_tags(final_text)
+                        if ass_placeholders_match(item["protected_text"], protected_final):
+                            cache_key = translation_cache_key("ass_protected", target_lang, item["protected_text"])
+                            translation_cache_put(cache_key, protected_final)
+                            RUNTIME_METRICS.bump("translate.cache.writes")
                     history.append(ass_plain_text(final_text).replace("\n", " ").strip())
-                progress.advance(task_id, len(work_batch))
+                if progress_tracker is not None:
+                    progress_tracker.stage_advance(len(work_batch))
+                else:
+                    progress.advance(task_id, len(work_batch))
+    if progress_tracker is not None:
+        progress_tracker.stage_done()
 
     if dedupe_groups:
         for grouped_items in dedupe_groups.values():
@@ -3959,7 +4233,14 @@ def translate_many_files_parallel_subprocess(
     return ok, failed
 
 
-def translate_single_file(client, console, args, in_path: Path, out_path: Path) -> int:
+def translate_single_file(
+    client,
+    console,
+    args,
+    in_path: Path,
+    out_path: Path,
+    progress_tracker: GlobalProgressTracker | None = None,
+) -> int:
     RUNTIME_METRICS.reset()
     text, line_ending, final_newline, bom = read_text(in_path)
     ext = in_path.suffix.lower()
@@ -3970,14 +4251,16 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
     tone_guide = ""
     srt_rolling_context = args.rolling_context
     if ext == ".srt" and srt_rolling_context > 0:
-        cprint(
-            console,
-            "SRT mode: forcing rolling-context=0 to avoid cross-block drift.",
-            "yellow",
-        )
+        if progress_tracker is None:
+            cprint(
+                console,
+                "SRT mode: forcing rolling-context=0 to avoid cross-block drift.",
+                "yellow",
+            )
         srt_rolling_context = 0
     if not args.skip_summary:
-        cprint(console, "Building summary...", "bold cyan")
+        if progress_tracker is None:
+            cprint(console, "Building summary...", "bold cyan")
         with RUNTIME_METRICS.timed("stage.summary"):
             if ext == ".ass":
                 plain_lines = collect_plain_lines_ass(text)
@@ -3986,14 +4269,30 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
             else:
                 print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
                 return 2
-            summary = summarize_subs(client, plain_lines, args.summary_chars, options, console)
-        cprint(console, "Summary ready.", "bold green")
+            summary = summarize_subs(
+                client,
+                plain_lines,
+                args.summary_chars,
+                options,
+                console,
+                progress_tracker=progress_tracker,
+            )
+        if progress_tracker is None:
+            cprint(console, "Summary ready.", "bold green")
         with RUNTIME_METRICS.timed("stage.tone_guide"):
-            tone_guide = build_tone_guide(client, summary, plain_lines, options, console)
-        if tone_guide:
+            tone_guide = build_tone_guide(
+                client,
+                summary,
+                plain_lines,
+                options,
+                console,
+                progress_tracker=progress_tracker,
+            )
+        if tone_guide and progress_tracker is None:
             cprint(console, "Tone guide ready.", "bold green")
 
-    cprint(console, "Translating...", "bold cyan")
+    if progress_tracker is None:
+        cprint(console, "Translating...", "bold cyan")
     with RUNTIME_METRICS.timed("stage.translate"):
         if ext == ".ass":
             out_text, translated_count = translate_ass(
@@ -4010,6 +4309,7 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
                 args.one_shot,
                 args.rolling_context,
                 args.fast,
+                progress_tracker=progress_tracker,
             )
         elif ext == ".srt":
             out_text, translated_count = translate_srt(
@@ -4025,6 +4325,7 @@ def translate_single_file(client, console, args, in_path: Path, out_path: Path) 
                 args.one_shot,
                 srt_rolling_context,
                 args.fast,
+                progress_tracker=progress_tracker,
             )
         else:
             print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
@@ -4052,10 +4353,9 @@ def run_multi_file_jobs(
 ) -> Tuple[int, int]:
     ok = 0
     failed = 0
-    if selected_total > 1:
-        print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
-
     if args.parallel_files > 1 and len(jobs) > 1:
+        if selected_total > 1:
+            print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
         return translate_many_files_parallel_subprocess(
             console,
             args,
@@ -4064,6 +4364,35 @@ def run_multi_file_jobs(
             skipped=skipped,
         )
 
+    use_persistent = RICH_AVAILABLE and selected_total > 1
+    if use_persistent:
+        with GlobalProgressTracker(console, selected_total, skipped=skipped) as tracker:
+            tracker.set_counts(ok, skipped, failed)
+            for file_path, out_file in jobs:
+                next_global = skipped + ok + failed + 1
+                tracker.start_file(
+                    file_path,
+                    next_global,
+                    selected_total,
+                    include_summary=(not args.skip_summary),
+                )
+                code = translate_single_file(
+                    client,
+                    console,
+                    args,
+                    file_path,
+                    out_file,
+                    progress_tracker=tracker,
+                )
+                if code == 0:
+                    ok += 1
+                else:
+                    failed += 1
+                tracker.set_counts(ok, skipped, failed)
+        return ok, failed
+
+    if selected_total > 1:
+        print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
     for file_path, out_file in jobs:
         if selected_total > 1:
             next_global = skipped + ok + failed + 1
@@ -4119,7 +4448,7 @@ def main() -> int:
     parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
     parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
     parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
-    parser.add_argument("--rolling-context", type=int, default=2, help="Use last N translated lines as rolling context")
+    parser.add_argument("--rolling-context", type=int, default=0, help="Use last N translated lines as rolling context")
     parser.add_argument(
         "--format-mode",
         choices=["auto", "json", "schema"],
