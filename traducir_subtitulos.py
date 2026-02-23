@@ -26,6 +26,7 @@ from urllib import request, error
 
 try:
     from rich.console import Console
+    from rich.columns import Columns
     from rich.panel import Panel
     from rich.table import Table
     from rich import box
@@ -208,6 +209,101 @@ def print_subtitle_options_table(console, files: List[Path]) -> None:
         label, style = subtitle_type_label_and_style(f)
         table.add_row(str(i), f"[{style}]{label}[/{style}]", f.name)
     console.print(table)
+
+
+def show_metrics_cards(
+    console,
+    metrics: List[Tuple[str, str, str | None]],
+    title: str | None = None,
+    columns: int = 3,
+) -> None:
+    if not metrics:
+        return
+    if not RICH_AVAILABLE:
+        if title:
+            cprint(console, title, "bold cyan")
+        for label, value, hint in metrics:
+            line = f"- {label}: {value}"
+            if hint:
+                line += f" ({hint})"
+            console.print(line)
+        return
+    if title:
+        cprint(console, title, "bold cyan")
+    cards = []
+    for label, value, hint in metrics:
+        body = [f"[bold cyan]{label}[/bold cyan]", f"[bold white]{value}[/bold white]"]
+        if hint:
+            body.append(f"[dim]{hint}[/dim]")
+        cards.append(
+            Panel(
+                "\n".join(body),
+                box=box.ROUNDED,
+                border_style="bright_black",
+                padding=(0, 1),
+                expand=True,
+            )
+        )
+    chunk = max(1, int(columns))
+    for idx in range(0, len(cards), chunk):
+        console.print(Columns(cards[idx : idx + chunk], expand=True, equal=True))
+
+
+def show_execution_roadmap(
+    console,
+    *,
+    include_summary: bool,
+    multi_file: bool,
+) -> None:
+    if not RICH_AVAILABLE:
+        steps = ["Analizar entradas"]
+        if include_summary:
+            steps.extend(["Resumen", "Guia de tono"])
+        steps.extend(["Traduccion", "Escritura de salida"])
+        if multi_file:
+            steps.append("Resumen global")
+        cprint(console, "Plan de ejecucion:", "bold cyan")
+        for i, step in enumerate(steps, 1):
+            console.print(f"  {i}. {step}")
+        return
+
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        row_styles=["", "dim"],
+    )
+    table.add_column("#", justify="right", width=3)
+    table.add_column("Estado", width=13)
+    table.add_column("Paso", min_width=24)
+    table.add_column("Detalle", min_width=24)
+
+    steps: List[Tuple[str, str, str]] = [
+        ("PENDIENTE", "Analizar entradas", "Validacion de archivos y parametros"),
+    ]
+    if include_summary:
+        steps.append(("PENDIENTE", "Resumen", "Contexto condensado para consistencia"))
+        steps.append(("PENDIENTE", "Guia de tono", "Reglas de estilo para traducir"))
+    steps.append(("ACTIVO", "Traduccion", "Lotes adaptativos + cache"))
+    steps.append(("PENDIENTE", "Escritura de salida", "Persistir subtitulos traducidos"))
+    if multi_file:
+        steps.append(("PENDIENTE", "Resumen global", "OK/omitidos/fallidos"))
+
+    for idx, (state, step, detail) in enumerate(steps, 1):
+        state_style = "bold yellow" if state == "ACTIVO" else "bright_black"
+        table.add_row(str(idx), f"[{state_style}]{state}[/{state_style}]", step, detail)
+
+    console.print(
+        Panel(
+            table,
+            title="Roadmap",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+    )
 
 
 def progress_bar(console):
@@ -3967,6 +4063,18 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     in_paths: List[Path] = []
     if files:
         print_subtitle_options_table(console, files)
+        ass_count = sum(1 for p in files if p.suffix.lower() == ".ass")
+        srt_count = sum(1 for p in files if p.suffix.lower() == ".srt")
+        show_metrics_cards(
+            console,
+            [
+                ("Archivos", str(len(files)), None),
+                ("ASS", str(ass_count), None),
+                ("SRT", str(srt_count), None),
+            ],
+            title="Vista rapida",
+            columns=3,
+        )
         raw = input("Selecciona numero(s) de archivo (ej. 1 3 5, 1-4) o escribe una ruta (o 'all'): ").strip()
 
         idxs = _parse_index_selection(raw, len(files))
@@ -4043,6 +4151,11 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     scope_choice = prompt_choice(console, "Alcance", 2, 2)
     limit = 10 if scope_choice == 1 else None
     skip_summary = scope_choice == 1
+    show_execution_roadmap(
+        console,
+        include_summary=(not skip_summary),
+        multi_file=(len(in_paths) > 1),
+    )
 
     model = choose_model(console, args.model)
 
@@ -4601,6 +4714,22 @@ def main() -> int:
                 continue
             jobs.append((file_path, out_file))
 
+        show_metrics_cards(
+            console,
+            [
+                ("Seleccionados", str(selected_total), None),
+                ("A procesar", str(len(jobs)), None),
+                ("Omitidos", str(skipped), "salida ya existente"),
+            ],
+            title="Resumen previo del lote",
+            columns=3,
+        )
+        show_execution_roadmap(
+            console,
+            include_summary=(not args.skip_summary),
+            multi_file=True,
+        )
+
         ok, failed = run_multi_file_jobs(
             client,
             console,
@@ -4638,6 +4767,22 @@ def main() -> int:
                 continue
             jobs.append((file_path, out_file))
 
+        show_metrics_cards(
+            console,
+            [
+                ("Seleccionados", str(selected_total), None),
+                ("A procesar", str(len(jobs)), None),
+                ("Omitidos", str(skipped), "salida ya existente"),
+            ],
+            title="Resumen previo multiarchivo",
+            columns=3,
+        )
+        show_execution_roadmap(
+            console,
+            include_summary=(not args.skip_summary),
+            multi_file=True,
+        )
+
         ok, failed = run_multi_file_jobs(
             client,
             console,
@@ -4657,6 +4802,21 @@ def main() -> int:
     in_path = in_paths[0]
     if out_path is None:
         out_path = build_output_path(in_path, args.target)
+    show_metrics_cards(
+        console,
+        [
+            ("Entrada", in_path.name, None),
+            ("Salida", out_path.name, None),
+            ("Modo", "Muestra" if args.limit is not None else "Completo", None),
+        ],
+        title="Ejecucion de archivo unico",
+        columns=3,
+    )
+    show_execution_roadmap(
+        console,
+        include_summary=(not args.skip_summary),
+        multi_file=False,
+    )
     return translate_single_file(client, console, args, in_path, out_path)
 
 
