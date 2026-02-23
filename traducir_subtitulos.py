@@ -26,9 +26,13 @@ from urllib import request, error
 
 try:
     from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
     from rich.progress import (
         BarColumn,
         Progress,
+        SpinnerColumn,
         TextColumn,
         TimeElapsedColumn,
         TimeRemainingColumn,
@@ -163,6 +167,21 @@ def subtitle_type_label_and_style(path: Path) -> Tuple[str, str]:
     return ext.lstrip(".").upper() or "FILE", "white"
 
 
+def show_app_header(console) -> None:
+    title = "SubLLM Traductor de Subtitulos"
+    subtitle = "ASS/SRT con Ollama local"
+    if RICH_AVAILABLE:
+        panel = Panel(
+            f"[bold cyan]{title}[/bold cyan]\n[dim]{subtitle}[/dim]",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 2),
+        )
+        console.print(panel)
+    else:
+        console.print(f"{title} - {subtitle}")
+
+
 def print_subtitle_option(console, idx: int, path: Path) -> None:
     label, style = subtitle_type_label_and_style(path)
     if RICH_AVAILABLE:
@@ -171,11 +190,33 @@ def print_subtitle_option(console, idx: int, path: Path) -> None:
         console.print(f"  {idx}) {path.name} ({label})")
 
 
+def print_subtitle_options_table(console, files: List[Path]) -> None:
+    if not RICH_AVAILABLE:
+        for i, f in enumerate(files, 1):
+            print_subtitle_option(console, i, f)
+        return
+    table = Table(
+        title="Archivos de subtitulos detectados",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold cyan",
+        show_lines=False,
+    )
+    table.add_column("#", justify="right", style="bold white", no_wrap=True)
+    table.add_column("Tipo", justify="center", no_wrap=True)
+    table.add_column("Archivo", overflow="fold")
+    for i, f in enumerate(files, 1):
+        label, style = subtitle_type_label_and_style(f)
+        table.add_row(str(i), f"[{style}]{label}[/{style}]", f.name)
+    console.print(table)
+
+
 def progress_bar(console):
     if RICH_AVAILABLE:
         return Progress(
+            SpinnerColumn(),
             TextColumn("{task.description}"),
             BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
             TextColumn("{task.percentage:>3.0f}%"),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
@@ -235,7 +276,7 @@ class GlobalProgressTracker:
         return False
 
     def _global_desc(self) -> str:
-        return f"Global | ok={self.ok}, skipped={self.skipped}, failed={self.failed}"
+        return f"General | ok={self.ok}, omitidos={self.skipped}, fallidos={self.failed}"
 
     def _is_ready(self) -> bool:
         return bool(self._enabled and self._progress is not None)
@@ -395,13 +436,13 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
     translate_core_elapsed = max(0.0, translate_elapsed - retry_chat_elapsed)
     other_elapsed = max(0.0, total_elapsed - (summary_elapsed + tone_elapsed + translate_elapsed))
 
-    cprint(console, "Timing breakdown:", "bold cyan")
-    cprint(console, f"- summary: {summary_elapsed:.1f}s", "cyan")
-    cprint(console, f"- tone guide: {tone_elapsed:.1f}s", "cyan")
-    cprint(console, f"- translate core: {translate_core_elapsed:.1f}s", "cyan")
-    cprint(console, f"- retries (LLM): {retry_chat_elapsed:.1f}s", "cyan")
+    cprint(console, "Desglose de tiempos:", "bold cyan")
+    cprint(console, f"- resumen: {summary_elapsed:.1f}s", "cyan")
+    cprint(console, f"- guia de tono: {tone_elapsed:.1f}s", "cyan")
+    cprint(console, f"- nucleo de traduccion: {translate_core_elapsed:.1f}s", "cyan")
+    cprint(console, f"- reintentos (LLM): {retry_chat_elapsed:.1f}s", "cyan")
     if other_elapsed >= 0.1:
-        cprint(console, f"- other: {other_elapsed:.1f}s", "cyan")
+        cprint(console, f"- otros: {other_elapsed:.1f}s", "cyan")
 
     retry_attempts = (
         RUNTIME_METRICS.counters.get("retry.batch_temp0.attempts", 0)
@@ -414,7 +455,7 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         cprint(
             console,
             (
-                "Retry counters: "
+                "Contadores de reintentos: "
                 f"temp0_batches={RUNTIME_METRICS.counters.get('retry.batch_temp0.attempts', 0)} "
                 f"(items={RUNTIME_METRICS.counters.get('retry.batch_temp0.items', 0)}), "
                 f"srt_linewise={RUNTIME_METRICS.counters.get('retry.srt_linewise.attempts', 0)} "
@@ -432,7 +473,7 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         fast_trunc_items = RUNTIME_METRICS.counters.get("retry.fast_budget.truncated_items", 0)
         cprint(
             console,
-            f"Fast retry budget: truncated_batches={fast_trunc_batches}, skipped_items={fast_trunc_items}",
+            f"Presupuesto rapido de reintentos: lotes_recortados={fast_trunc_batches}, items_omitidos={fast_trunc_items}",
             "cyan",
         )
     batch_calls = RUNTIME_METRICS.counters.get("translate.json_batch.calls", 0)
@@ -441,7 +482,7 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         top_items = RUNTIME_METRICS.counters.get("translate.top_level_batch_items", 0)
         cprint(
             console,
-            f"Top-level batches: {top_batches} (avg_items={top_items / float(top_batches):.1f})",
+            f"Lotes de primer nivel: {top_batches} (items_promedio={top_items / float(top_batches):.1f})",
             "cyan",
         )
     if batch_calls:
@@ -451,7 +492,7 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         avg_chars = batch_chars / float(batch_calls)
         cprint(
             console,
-            f"Batch stats: calls={batch_calls}, avg_items={avg_items:.1f}, avg_input_chars={avg_chars:.0f}",
+            f"Estadisticas de lotes: llamadas={batch_calls}, items_promedio={avg_items:.1f}, chars_entrada_promedio={avg_chars:.0f}",
             "cyan",
         )
     cache_hits = RUNTIME_METRICS.counters.get("translate.cache.hits", 0)
@@ -462,18 +503,18 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         hit_rate = (cache_hits / float(cache_lookups)) * 100.0
         cprint(
             console,
-            f"Translation cache: hits={cache_hits}, misses={cache_misses}, writes={cache_writes}, hit_rate={hit_rate:.1f}%",
+            f"Cache de traduccion: aciertos={cache_hits}, fallos={cache_misses}, escrituras={cache_writes}, tasa_acierto={hit_rate:.1f}%",
             "cyan",
         )
     schema_retries = RUNTIME_METRICS.counters.get("format.schema_retry.attempts", 0)
     if schema_retries:
-        cprint(console, f"Format fallbacks: schema_retry={schema_retries}", "cyan")
+        cprint(console, f"Fallbacks de formato: schema_retry={schema_retries}", "cyan")
     split_recursions = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
     split_cutoff = RUNTIME_METRICS.counters.get("translate.split.depth_cutoff", 0)
     if split_recursions or split_cutoff:
         cprint(
             console,
-            f"Split stats: recursions={split_recursions}, depth_cutoff={split_cutoff}",
+            f"Estadisticas de split: recursiones={split_recursions}, corte_profundidad={split_cutoff}",
             "cyan",
         )
     reason_entries = [
@@ -484,13 +525,13 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
     if reason_entries:
         reason_entries.sort(key=lambda pair: pair[1], reverse=True)
         top = ", ".join(f"{reason}={count}" for reason, count in reason_entries[:6])
-        cprint(console, f"Top flagged reasons: {top}", "cyan")
+        cprint(console, f"Motivos mas marcados: {top}", "cyan")
     if resolve_format_mode() == "auto":
         cprint(
             console,
             (
-                f"Auto-format stats: json_attempts={AUTO_JSON_ATTEMPTS}, "
-                f"json_fails={AUTO_JSON_FAILS}, json_disabled={AUTO_JSON_DISABLED}"
+                f"Estadisticas auto-formato: intentos_json={AUTO_JSON_ATTEMPTS}, "
+                f"fallos_json={AUTO_JSON_FAILS}, json_deshabilitado={AUTO_JSON_DISABLED}"
             ),
             "cyan",
         )
@@ -500,7 +541,7 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         avg_prompt_chars = RUNTIME_METRICS.counters.get("ollama.prompt_chars", 0) / float(ollama_calls)
         cprint(
             console,
-            f"Ollama calls: {ollama_calls} (avg={avg_ollama:.2f}s, avg_prompt_chars={avg_prompt_chars:.0f})",
+            f"Llamadas a Ollama: {ollama_calls} (promedio={avg_ollama:.2f}s, chars_prompt_promedio={avg_prompt_chars:.0f})",
             "cyan",
         )
 
@@ -729,7 +770,7 @@ def summarize_subs(
     if len(summary_lines) < cleaned_count:
         cprint(
             console,
-            f"Summary corpus reduced: {cleaned_count} -> {len(summary_lines)} line(s).",
+            f"Corpus de resumen reducido: {cleaned_count} -> {len(summary_lines)} linea(s).",
             "yellow",
         )
     with RUNTIME_METRICS.timed("summary.total"):
@@ -761,7 +802,7 @@ def summarize_subs(
                 progress_tracker.stage_advance(1)
         else:
             with progress_bar(console) as progress:
-                task_id = progress.add_task("Summary", total=len(chunks))
+                task_id = progress.add_task("Resumen", total=len(chunks))
                 for chunk in chunks:
                     user_msg = (
                         "Summarize the following subtitle text in Spanish. "
@@ -825,7 +866,7 @@ def build_tone_guide(
         f"Summary: {summary}\n\n"
         f"Sample lines:\n{sample}"
     )
-    cprint(console, "Building tone guide...", "bold cyan")
+    cprint(console, "Construyendo guia de tono...", "bold cyan")
     with RUNTIME_METRICS.timed("tone_guide.total"):
         with RUNTIME_METRICS.timed("tone_guide.chat"):
             content = client.chat(
@@ -1745,7 +1786,7 @@ def build_adaptive_batches(
         if len(items) > cap:
             cprint(
                 console,
-                f"--one-shot requested but batch-size={cap} < items={len(items)}; using adaptive batches.",
+                f"--one-shot solicitado pero batch-size={cap} < items={len(items)}; usando lotes adaptativos.",
                 "yellow",
             )
         elif est_total + reserve_out <= budget:
@@ -1753,7 +1794,7 @@ def build_adaptive_batches(
         else:
             cprint(
                 console,
-                "--one-shot requested but estimated prompt does not fit num_ctx; using adaptive batches.",
+                "--one-shot solicitado pero el prompt estimado no entra en num_ctx; usando lotes adaptativos.",
                 "yellow",
             )
 
@@ -2785,7 +2826,7 @@ def run_ass_surgical_fallback(
                 item["forced_restored"] = repaired
         return
     if total > 20:
-        cprint(console, f"Large ASS repair set ({total}); applying chunked surgical fallback.", "yellow")
+        cprint(console, f"Conjunto grande de reparacion ASS ({total}); aplicando fallback quirurgico por bloques.", "yellow")
     for chunk in batched(failed_items, 8):
         repaired_lines = translate_ass_slots_batch_with_split(
             client,
@@ -2940,7 +2981,7 @@ def translate_srt(
         saved = len(translatable_items) - len(deduped_items)
         cprint(
             console,
-            f"SRT dedupe: {len(translatable_items)} -> {len(deduped_items)} unique block(s) (saved {saved} LLM items).",
+            f"Deduplicacion SRT: {len(translatable_items)} -> {len(deduped_items)} bloque(s) unicos (ahorrados {saved} items LLM).",
             "yellow",
         )
         RUNTIME_METRICS.bump("srt.dedupe.saved_items", saved)
@@ -2956,7 +2997,7 @@ def translate_srt(
     if progress_tracker is not None:
         progress_tracker.stage_start("translate", max(1, len(deduped_items)))
     with progress_ctx as progress:
-        task_id = progress.add_task("Translation", total=len(deduped_items)) if progress_tracker is None else 0
+        task_id = progress.add_task("Traduccion", total=len(deduped_items)) if progress_tracker is None else 0
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
@@ -3029,8 +3070,8 @@ def translate_srt(
                         cprint(
                             console,
                             (
-                                f"Adaptive batch cap: {active_batch_cap} -> {new_cap} "
-                                f"(split={split_after - split_before}, fail_rate={severe_ratio:.0%})"
+                                f"Tope adaptativo de lote: {active_batch_cap} -> {new_cap} "
+                                f"(split={split_after - split_before}, tasa_fallo={severe_ratio:.0%})"
                             ),
                             "yellow",
                         )
@@ -3042,7 +3083,7 @@ def translate_srt(
                 if failed_items and len(failed_items) > repair_limit:
                     cprint(
                         console,
-                        f"High fail-rate: {len(failed_items)}/{len(work_batch)} SRT flagged. Retrying batch @temp=0...",
+                        f"Tasa alta de fallos: {len(failed_items)}/{len(work_batch)} SRT marcado(s). Reintentando lote @temp=0...",
                         "yellow",
                     )
                     retry_failed_items_batch(
@@ -3198,7 +3239,7 @@ def translate_ass(
         saved = len(translatable_items) - len(deduped_items)
         cprint(
             console,
-            f"ASS dedupe: {len(translatable_items)} -> {len(deduped_items)} unique line(s) (saved {saved} LLM items).",
+            f"Deduplicacion ASS: {len(translatable_items)} -> {len(deduped_items)} linea(s) unicas (ahorrados {saved} items LLM).",
             "yellow",
         )
         RUNTIME_METRICS.bump("ass.dedupe.saved_items", saved)
@@ -3219,7 +3260,7 @@ def translate_ass(
     if progress_tracker is not None:
         progress_tracker.stage_start("translate", max(1, len(deduped_items)))
     with progress_ctx as progress:
-        task_id = progress.add_task("Translation", total=len(deduped_items)) if progress_tracker is None else 0
+        task_id = progress.add_task("Traduccion", total=len(deduped_items)) if progress_tracker is None else 0
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
@@ -3288,8 +3329,8 @@ def translate_ass(
                         cprint(
                             console,
                             (
-                                f"Adaptive batch cap: {active_batch_cap} -> {new_cap} "
-                                f"(split={split_after - split_before}, fail_rate={severe_ratio:.0%})"
+                                f"Tope adaptativo de lote: {active_batch_cap} -> {new_cap} "
+                                f"(split={split_after - split_before}, tasa_fallo={severe_ratio:.0%})"
                             ),
                             "yellow",
                         )
@@ -3302,7 +3343,7 @@ def translate_ass(
                     if len(failed_items) > repair_limit:
                         cprint(
                             console,
-                            f"High fail-rate: {len(failed_items)}/{len(work_batch)} ASS flagged. Retrying batch @temp=0...",
+                            f"Tasa alta de fallos: {len(failed_items)}/{len(work_batch)} ASS marcado(s). Reintentando lote @temp=0...",
                             "yellow",
                         )
                     if len(failed_items) > repair_limit or not fast_mode:
@@ -3487,7 +3528,7 @@ def translate_ass_segment(
     if trans_tasks:
         segments = [t[2] for t in trans_tasks]
         with progress_bar(console) as progress:
-            task_id = progress.add_task("Translation", total=len(segments))
+            task_id = progress.add_task("Traduccion", total=len(segments))
             for batch in batched(segments, batch_size):
                 out = translate_batch(client, batch, summary, tone_guide, target_lang, options)
                 if out is None or len(out) != len(batch):
@@ -3496,7 +3537,7 @@ def translate_ass_segment(
                         out.append(translate_one(client, item, summary, tone_guide, target_lang, options))
                 translations.extend(out)
                 progress.advance(task_id, len(batch))
-        cprint(console, "Applying ASS safety checks...", "cyan")
+        cprint(console, "Aplicando validaciones de seguridad ASS...", "cyan")
 
     for (line_idx, token_idx, source_token), translated in zip(trans_tasks, translations):
         state = line_state.get(line_idx)
@@ -3528,7 +3569,7 @@ def translate_ass_segment(
     repair_limit = max(8, int(math.ceil(0.15 * max(1, len(trans_tasks)))))
     allow_llm_repair = len(failed_tasks) <= repair_limit
     if failed_tasks and not allow_llm_repair:
-        cprint(console, "Too many lines flagged; skipping LLM repair to keep performance", "yellow")
+        cprint(console, "Demasiadas lineas marcadas; se omite reparacion LLM para mantener rendimiento", "yellow")
 
     if failed_tasks and allow_llm_repair:
         repair_items = []
@@ -3698,6 +3739,15 @@ def detect_language_from_filename(path: Path) -> str | None:
     return None
 
 
+def display_language_label(lang: str) -> str:
+    mapping = {
+        "English": "Ingles",
+        "Spanish": "Espanol",
+        "Unknown": "Desconocido",
+    }
+    return mapping.get(lang, lang)
+
+
 def bulk_dir() -> Path:
     """Return the directory where bulk subtitle files live.
 
@@ -3809,35 +3859,35 @@ def choose_model(console, default_model: str) -> str:
         ordered.insert(0, "gemma3:4b")
 
     if not ordered:
-        cprint(console, "No installed models found via `ollama list`.", "yellow")
-        return default_model or input("Enter model name: ").strip()
+        cprint(console, "No se encontraron modelos instalados via `ollama list`.", "yellow")
+        return default_model or input("Ingresa el nombre del modelo: ").strip()
 
-    cprint(console, "Choose model:", "bold cyan")
+    cprint(console, "Elige modelo:", "bold cyan")
     for i, name in enumerate(ordered, 1):
         console.print(f"  {i}) {name}")
-    console.print("  0) Enter custom model")
+    console.print("  0) Escribir modelo personalizado")
 
     default_idx = None
     if default_model in ordered:
         default_idx = ordered.index(default_model) + 1
 
-    prompt = "Model"
+    prompt = "Modelo"
     while True:
-        suffix = f" [default {default_idx}]" if default_idx else ""
+        suffix = f" [predeterminado {default_idx}]" if default_idx else ""
         raw = input(f"{prompt}{suffix}: ").strip()
         if raw == "" and default_idx:
             return ordered[default_idx - 1]
         if raw.isdigit():
             num = int(raw)
             if num == 0:
-                custom = input("Enter model name: ").strip()
+                custom = input("Ingresa el nombre del modelo: ").strip()
                 if custom:
                     return custom
             elif 1 <= num <= len(ordered):
                 return ordered[num - 1]
         elif raw:
             return raw
-        cprint(console, "Invalid choice. Try again.", "yellow")
+        cprint(console, "Opcion invalida. Intenta de nuevo.", "yellow")
 
 
 def prompt_choice(
@@ -3847,7 +3897,7 @@ def prompt_choice(
     default_value: int | None = None,
 ) -> int:
     while True:
-        suffix = f" [default {default_value}]" if default_value else ""
+        suffix = f" [predeterminado {default_value}]" if default_value else ""
         choice = input(f"{prompt}{suffix}: ").strip()
         if choice == "" and default_value is not None:
             return default_value
@@ -3855,7 +3905,7 @@ def prompt_choice(
             num = int(choice)
             if 1 <= num <= max_value:
                 return num
-        cprint(console, "Invalid choice. Try again.", "yellow")
+        cprint(console, "Opcion invalida. Intenta de nuevo.", "yellow")
 
 
 def target_suffix_for_lang(target_lang: str) -> str:
@@ -3916,10 +3966,8 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     files = list_subtitle_files([".srt", ".ass"])
     in_paths: List[Path] = []
     if files:
-        cprint(console, "Subtitle files found:", "bold cyan")
-        for i, f in enumerate(files, 1):
-            print_subtitle_option(console, i, f)
-        raw = input("Select file number(s) (e.g. 1 3 5, 1-4) or type a path (or 'all'): ").strip()
+        print_subtitle_options_table(console, files)
+        raw = input("Selecciona numero(s) de archivo (ej. 1 3 5, 1-4) o escribe una ruta (o 'all'): ").strip()
 
         idxs = _parse_index_selection(raw, len(files))
         if idxs:
@@ -3935,7 +3983,7 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
             if len(files) == 1:
                 in_paths = [files[0]]
     if not in_paths:
-        raw = input("Enter subtitle file path (or 'all'): ").strip()
+        raw = input("Ingresa ruta de subtitulos (o 'all'): ").strip()
         idxs = _parse_index_selection(raw, len(files))
         if idxs and files:
             in_paths = [files[i - 1] for i in idxs]
@@ -3946,7 +3994,7 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
 
     missing = [p for p in in_paths if not p.exists()]
     if missing:
-        raise RuntimeError(f"Input not found: {missing[0]}")
+        raise RuntimeError(f"Entrada no encontrada: {missing[0]}")
 
     sample_path = in_paths[0]
     text, _, _, _ = read_text(sample_path)
@@ -3962,7 +4010,7 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
         if sampled_preview:
             preview_pool = sampled_preview
 
-    cprint(console, "\nSample (first 8 lines):", "bold cyan")
+    cprint(console, "\nMuestra (primeras 8 lineas):", "bold cyan")
     for line in preview_pool[:8]:
         console.print(f"  {line}")
 
@@ -3973,25 +4021,26 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
         detected = hint_lang
         confidence = max(confidence, 0.55)
     conf_pct = int(confidence * 100)
+    detected_label = display_language_label(detected)
     cprint(
         console,
-        f"\nDetected input language: {detected} ({conf_pct}% confidence)",
+        f"\nIdioma de entrada detectado: {detected_label} ({conf_pct}% confianza)",
         "bold green",
     )
 
     default_out = 1
     if detected == "Spanish":
         default_out = 2
-    cprint(console, "Choose output language:", "bold cyan")
-    console.print("  1) Spanish")
-    console.print("  2) English")
-    out_choice = prompt_choice(console, "Output language", 2, default_out)
+    cprint(console, "Elige idioma de salida:", "bold cyan")
+    console.print("  1) Espanol")
+    console.print("  2) Ingles")
+    out_choice = prompt_choice(console, "Idioma de salida", 2, default_out)
     target_lang = "Spanish" if out_choice == 1 else "English"
 
-    cprint(console, "Translate sample or full?", "bold cyan")
-    console.print("  1) Sample (10 lines)")
-    console.print("  2) Full")
-    scope_choice = prompt_choice(console, "Scope", 2, 2)
+    cprint(console, "Traducir muestra o completo?", "bold cyan")
+    console.print("  1) Muestra (10 lineas)")
+    console.print("  2) Completo")
+    scope_choice = prompt_choice(console, "Alcance", 2, 2)
     limit = 10 if scope_choice == 1 else None
     skip_summary = scope_choice == 1
 
@@ -4000,12 +4049,12 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     out_path = None
     if len(in_paths) == 1:
         out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(sample_path, target_lang)
-        cprint(console, f"Output file: {out_path}", "bold cyan")
+        cprint(console, f"Archivo de salida: {out_path}", "bold cyan")
     else:
-        cprint(console, f"Selected files: {len(in_paths)}", "bold cyan")
-        cprint(console, "Output files will be generated per input file.", "bold cyan")
+        cprint(console, f"Archivos seleccionados: {len(in_paths)}", "bold cyan")
+        cprint(console, "Se generara un archivo de salida por cada entrada.", "bold cyan")
     if skip_summary:
-        cprint(console, "Sample mode: skipping summary for speed.", "yellow")
+        cprint(console, "Modo muestra: se omite resumen para mayor velocidad.", "yellow")
     return in_paths, out_path, target_lang, limit, skip_summary, model
 
 
@@ -4035,8 +4084,8 @@ def apply_fast_profile(args, console) -> None:
     gpu_display = args.num_gpu if args.num_gpu is not None else "auto"
     cprint(
         console,
-        f"Fast profile: batch={args.batch_size}, ctx={args.num_ctx}, predict={args.num_predict}, "
-        f"threads={args.num_threads}, gpu={gpu_display}, rolling={args.rolling_context}, summary=off, one_shot=on",
+        f"Perfil rapido: batch={args.batch_size}, ctx={args.num_ctx}, predict={args.num_predict}, "
+        f"hilos={args.num_threads}, gpu={gpu_display}, contexto={args.rolling_context}, resumen=off, one_shot=on",
         "bold cyan",
     )
 
@@ -4132,11 +4181,17 @@ def extract_translation_summary(output: str) -> str:
         return ""
     lines = output.splitlines()
     patterns = (
+        "Tiempo (traduccion):",
         "Elapsed (translate):",
+        "Contadores de reintentos:",
         "Retry counters:",
+        "Presupuesto rapido de reintentos:",
         "Fast retry budget:",
+        "Estadisticas de split:",
         "Split stats:",
+        "Motivos mas marcados:",
         "Top flagged reasons:",
+        "Llamadas a Ollama:",
         "Ollama calls:",
     )
     selected = [line.strip() for line in lines if any(p in line for p in patterns)]
@@ -4153,8 +4208,8 @@ def format_global_file_progress(done: int, total: int, ok: int, skipped: int, fa
         pct = (done / float(total)) * 100.0
         remaining = max(0, total - done)
     return (
-        f"Global progress: {done}/{total} ({pct:.0f}%) | "
-        f"ok={ok}, skipped={skipped}, failed={failed}, remaining={remaining}"
+        f"Progreso global: {done}/{total} ({pct:.0f}%) | "
+        f"ok={ok}, omitidos={skipped}, fallidos={failed}, restantes={remaining}"
     )
 
 
@@ -4174,7 +4229,7 @@ def translate_many_files_parallel_subprocess(
     total = len(jobs)
     cprint(
         console,
-        f"Parallel file mode: workers={max_workers}, jobs={total}, selected={selected_total}",
+        f"Modo paralelo de archivos: workers={max_workers}, trabajos={total}, seleccionados={selected_total}",
         "bold cyan",
     )
     ok = 0
@@ -4192,7 +4247,7 @@ def translate_many_files_parallel_subprocess(
                 code, elapsed, output = future.result()
             except Exception as exc:
                 failed += 1
-                cprint(console, f"[{done}/{total}] FAIL {in_path.name}: {exc}", "bold red")
+                cprint(console, f"[{done}/{total}] ERROR {in_path.name}: {exc}", "bold red")
                 print_global_file_progress(
                     console,
                     skipped + done,
@@ -4218,7 +4273,7 @@ def translate_many_files_parallel_subprocess(
                 )
                 continue
             failed += 1
-            cprint(console, f"[{done}/{total}] FAIL {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
+            cprint(console, f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
             if output.strip():
                 tail = "\n".join(output.splitlines()[-30:])
                 console.print(tail)
@@ -4254,20 +4309,20 @@ def translate_single_file(
         if progress_tracker is None:
             cprint(
                 console,
-                "SRT mode: forcing rolling-context=0 to avoid cross-block drift.",
+                "Modo SRT: se fuerza rolling-context=0 para evitar deriva entre bloques.",
                 "yellow",
             )
         srt_rolling_context = 0
     if not args.skip_summary:
         if progress_tracker is None:
-            cprint(console, "Building summary...", "bold cyan")
+            cprint(console, "Construyendo resumen...", "bold cyan")
         with RUNTIME_METRICS.timed("stage.summary"):
             if ext == ".ass":
                 plain_lines = collect_plain_lines_ass(text)
             elif ext == ".srt":
                 plain_lines = collect_plain_lines_srt(text)
             else:
-                print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
+                print("Tipo de archivo no soportado. Usa .ass o .srt", file=sys.stderr)
                 return 2
             summary = summarize_subs(
                 client,
@@ -4278,7 +4333,7 @@ def translate_single_file(
                 progress_tracker=progress_tracker,
             )
         if progress_tracker is None:
-            cprint(console, "Summary ready.", "bold green")
+            cprint(console, "Resumen listo.", "bold green")
         with RUNTIME_METRICS.timed("stage.tone_guide"):
             tone_guide = build_tone_guide(
                 client,
@@ -4289,10 +4344,10 @@ def translate_single_file(
                 progress_tracker=progress_tracker,
             )
         if tone_guide and progress_tracker is None:
-            cprint(console, "Tone guide ready.", "bold green")
+            cprint(console, "Guia de tono lista.", "bold green")
 
     if progress_tracker is None:
-        cprint(console, "Translating...", "bold cyan")
+        cprint(console, "Traduciendo...", "bold cyan")
     with RUNTIME_METRICS.timed("stage.translate"):
         if ext == ".ass":
             out_text, translated_count = translate_ass(
@@ -4328,17 +4383,17 @@ def translate_single_file(
                 progress_tracker=progress_tracker,
             )
         else:
-            print("Unsupported file type. Use .ass or .srt", file=sys.stderr)
+            print("Tipo de archivo no soportado. Usa .ass o .srt", file=sys.stderr)
             return 2
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_text(out_path, out_text.splitlines(), line_ending, final_newline, bom)
     translate_elapsed = RUNTIME_METRICS.seconds.get("stage.translate", 0.0)
     total_elapsed = time.perf_counter() - start_total
-    cprint(console, f"Translated blocks: {translated_count}", "bold green")
-    cprint(console, f"Output written to: {out_path}", "bold green")
-    cprint(console, f"Elapsed (translate): {translate_elapsed:.1f}s", "bold green")
-    cprint(console, f"Elapsed (total): {total_elapsed:.1f}s", "bold green")
+    cprint(console, f"Bloques traducidos: {translated_count}", "bold green")
+    cprint(console, f"Archivo generado: {out_path}", "bold green")
+    cprint(console, f"Tiempo (traduccion): {translate_elapsed:.1f}s", "bold green")
+    cprint(console, f"Tiempo (total): {total_elapsed:.1f}s", "bold green")
     print_runtime_breakdown(console, total_elapsed)
     return 0
 
@@ -4396,9 +4451,9 @@ def run_multi_file_jobs(
     for file_path, out_file in jobs:
         if selected_total > 1:
             next_global = skipped + ok + failed + 1
-            cprint(console, f"\n=== Translating [{next_global}/{selected_total}]: {file_path.name} ===", "bold cyan")
+            cprint(console, f"\n=== Traduciendo [{next_global}/{selected_total}]: {file_path.name} ===", "bold cyan")
         else:
-            cprint(console, f"\n=== Translating: {file_path.name} ===", "bold cyan")
+            cprint(console, f"\n=== Traduciendo: {file_path.name} ===", "bold cyan")
         code = translate_single_file(client, console, args, file_path, out_file)
         if code == 0:
             ok += 1
@@ -4419,75 +4474,78 @@ def run_multi_file_jobs(
 def main() -> int:
     console = get_console()
     RUNTIME_METRICS.reset()
-    parser = argparse.ArgumentParser(description="Translate .ASS/.SRT subtitles using local Ollama.")
-    parser.add_argument("--in", dest="in_path", help="Input subtitle file (or glob in --batch)")
-    parser.add_argument("--out", dest="out_path", help="Output subtitle file")
-    parser.add_argument("--model", default="gemma3:4b", help="Ollama model name")
-    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host")
-    parser.add_argument("--target", default="Spanish", help="Target language")
-    parser.add_argument("--batch-size", type=int, default=256, help="Batch size upper bound for translation")
-    parser.add_argument("--summary-chars", type=int, default=6000, help="Max chars per summary chunk")
-    parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout seconds")
-    parser.add_argument("--keep-alive", default="10m", help="Ollama keep_alive value (e.g. 10m, 0)")
-    parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
-    parser.add_argument("--num-predict", type=int, help="Limit tokens generated per response")
-    parser.add_argument("--num-ctx", type=int, help="Context window size")
-    parser.add_argument("--num-threads", type=int, help="Threads for model execution")
-    parser.add_argument("--num-gpu", type=int, help="GPU layers for model execution")
-    parser.add_argument("--limit", type=int, help="Translate only the first N dialogue blocks")
-    parser.add_argument("--skip-summary", action="store_true", help="Skip the summary step")
-    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
-    parser.add_argument("--batch", action="store_true", help="Translate all subtitle files in SUBS_BULK")
+    parser = argparse.ArgumentParser(description="Traduce subtitulos .ASS/.SRT usando Ollama local.")
+    parser.add_argument("--in", dest="in_path", help="Archivo de entrada (o patron glob con --batch)")
+    parser.add_argument("--out", dest="out_path", help="Archivo de salida")
+    parser.add_argument("--model", default="gemma3:4b", help="Nombre del modelo en Ollama")
+    parser.add_argument("--host", default="http://localhost:11434", help="Host de Ollama")
+    parser.add_argument("--target", default="Spanish", help="Idioma objetivo")
+    parser.add_argument("--batch-size", type=int, default=256, help="Tope de tamano de lote para traduccion")
+    parser.add_argument("--summary-chars", type=int, default=6000, help="Maximo de caracteres por chunk de resumen")
+    parser.add_argument("--timeout", type=int, default=300, help="Timeout HTTP en segundos")
+    parser.add_argument("--keep-alive", default="10m", help="Valor keep_alive de Ollama (ej. 10m, 0)")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Temperatura del LLM")
+    parser.add_argument("--num-predict", type=int, help="Limite de tokens generados por respuesta")
+    parser.add_argument("--num-ctx", type=int, help="Ventana de contexto")
+    parser.add_argument("--num-threads", type=int, help="Hilos para ejecucion del modelo")
+    parser.add_argument("--num-gpu", type=int, help="Capas GPU para ejecucion del modelo")
+    parser.add_argument("--limit", type=int, help="Traduce solo los primeros N bloques de dialogo")
+    parser.add_argument("--skip-summary", action="store_true", help="Omite el paso de resumen")
+    parser.add_argument("--interactive", action="store_true", help="Modo interactivo")
+    parser.add_argument("--batch", action="store_true", help="Traduce todos los subtitulos de SUBS_BULK")
     parser.add_argument(
         "--parallel-files",
         type=int,
         default=1,
-        help="Translate multiple files in parallel for --batch or multi-file mode (subprocess workers)",
+        help="Traduce multiples archivos en paralelo para --batch o modo multiarchivo (workers por subprocess)",
     )
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite outputs in --batch mode")
-    parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="ASS translation mode")
-    parser.add_argument("--fast", action="store_true", help="Apply fast profile defaults")
-    parser.add_argument("--one-shot", action="store_true", help="Force one batch when it fits context limits")
-    parser.add_argument("--rolling-context", type=int, default=0, help="Use last N translated lines as rolling context")
+    parser.add_argument("--overwrite", action="store_true", help="Sobrescribe salidas en modo --batch")
+    parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="Modo de traduccion ASS")
+    parser.add_argument("--fast", action="store_true", help="Aplica valores predeterminados de perfil rapido")
+    parser.add_argument("--one-shot", action="store_true", help="Fuerza un solo lote cuando entra en contexto")
+    parser.add_argument("--rolling-context", type=int, default=0, help="Usa las ultimas N lineas traducidas como contexto")
     parser.add_argument(
         "--format-mode",
         choices=["auto", "json", "schema"],
         default="auto",
-        help="Structured output mode: auto=json fast path + schema retry, json=always json, schema=always schema",
+        help="Modo de salida estructurada: auto=json rapido + reintento schema, json=siempre json, schema=siempre schema",
     )
     parser.add_argument(
         "--minify-json",
         dest="minify_json",
         action="store_true",
         default=True,
-        help="Minify JSON payload embedded in prompts (default: on)",
+        help="Minifica el JSON embebido en prompts (predeterminado: on)",
     )
     parser.add_argument(
         "--no-minify-json",
         dest="minify_json",
         action="store_false",
-        help="Disable minified JSON payloads in prompts",
+        help="Deshabilita JSON minificado en prompts",
     )
-    parser.add_argument("--bench", action="store_true", help="Enable detailed per-call bench logging")
-    parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
+    parser.add_argument("--bench", action="store_true", help="Activa logs detallados de bench por llamada")
+    parser.add_argument("--self-test", action="store_true", help="Ejecuta auto-pruebas internas y sale")
     args = parser.parse_args()
     set_runtime_flags(args.format_mode, args.minify_json, args.bench)
 
     if args.self_test:
         self_test_ass_repair_snippet()
         self_test_hybrid_pipeline()
-        cprint(console, "Self-test OK", "bold green")
+        cprint(console, "Auto-prueba OK", "bold green")
         return 0
 
     if args.batch and args.interactive:
-        print("Cannot combine --batch with --interactive", file=sys.stderr)
+        print("No se puede combinar --batch con --interactive", file=sys.stderr)
         return 2
     if args.batch and args.out_path:
-        print("--out is not supported in --batch mode", file=sys.stderr)
+        print("--out no esta soportado en modo --batch", file=sys.stderr)
         return 2
     if args.parallel_files < 1:
-        print("--parallel-files must be >= 1", file=sys.stderr)
+        print("--parallel-files debe ser >= 1", file=sys.stderr)
         return 2
+
+    if args.interactive or not args.in_path:
+        show_app_header(console)
 
     in_paths: List[Path] = []
     out_path = None
@@ -4507,7 +4565,7 @@ def main() -> int:
         else:
             in_path = resolve_input_path(args.in_path)
             if not in_path.exists():
-                print(f"Input not found: {in_path}", file=sys.stderr)
+                print(f"Entrada no encontrada: {in_path}", file=sys.stderr)
                 return 2
             in_paths = [in_path]
             out_path = resolve_output_path(args.out_path) if args.out_path else build_output_path(in_path, args.target)
@@ -4518,7 +4576,7 @@ def main() -> int:
         cprint(
             console,
             (
-                f"Bench mode ON | format_mode={resolve_format_mode()} | "
+                f"Modo bench ON | format_mode={resolve_format_mode()} | "
                 f"minify_json={'on' if MINIFY_JSON_PROMPTS else 'off'}"
             ),
             "bold cyan",
@@ -4529,7 +4587,7 @@ def main() -> int:
     if args.batch:
         files = collect_batch_inputs(args.in_path, args.target)
         if not files:
-            cprint(console, "No subtitle files found for batch translation.", "yellow")
+            cprint(console, "No se encontraron subtitulos para traduccion por lotes.", "yellow")
             return 0
 
         selected_total = len(files)
@@ -4539,7 +4597,7 @@ def main() -> int:
             out_file = build_output_path(file_path, args.target)
             if out_file.exists() and not args.overwrite:
                 skipped += 1
-                cprint(console, f"Skip (exists): {out_file.name}", "yellow")
+                cprint(console, f"Omitido (ya existe): {out_file.name}", "yellow")
                 continue
             jobs.append((file_path, out_file))
 
@@ -4554,19 +4612,19 @@ def main() -> int:
 
         cprint(
             console,
-            f"\nBatch summary -> ok: {ok}, skipped: {skipped}, failed: {failed}",
+            f"\nResumen de lote -> ok: {ok}, omitidos: {skipped}, fallidos: {failed}",
             "bold cyan" if failed == 0 else "bold yellow",
         )
         return 0 if failed == 0 else 1
 
     if not in_paths:
-        print("No input selected.", file=sys.stderr)
+        print("No se selecciono ninguna entrada.", file=sys.stderr)
         return 2
 
     # If the user selected multiple files interactively, run a mini-batch.
     if len(in_paths) > 1:
         if args.out_path:
-            print("--out is not supported when translating multiple inputs", file=sys.stderr)
+            print("--out no esta soportado al traducir multiples entradas", file=sys.stderr)
             return 2
 
         selected_total = len(in_paths)
@@ -4576,7 +4634,7 @@ def main() -> int:
             out_file = build_output_path(file_path, args.target)
             if out_file.exists() and not args.overwrite:
                 skipped += 1
-                cprint(console, f"Skip (exists): {out_file.name}", "yellow")
+                cprint(console, f"Omitido (ya existe): {out_file.name}", "yellow")
                 continue
             jobs.append((file_path, out_file))
 
@@ -4591,7 +4649,7 @@ def main() -> int:
 
         cprint(
             console,
-            f"\nMulti-file summary -> ok: {ok}, skipped: {skipped}, failed: {failed}",
+            f"\nResumen multiarchivo -> ok: {ok}, omitidos: {skipped}, fallidos: {failed}",
             "bold cyan" if failed == 0 else "bold yellow",
         )
         return 0 if failed == 0 else 1
