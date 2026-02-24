@@ -89,7 +89,7 @@ BULK_DIR_NAME = "SUBS_BULK"
 SINGLE_TRANSLATION_CACHE = {}
 REPAIR_BATCH_MAX = 8
 MAX_REPAIR_FALLBACK_LINES = 3
-ASS_MAX_BATCH_ITEMS = 32
+ASS_MAX_BATCH_ITEMS = 48
 ONE_SHOT_MAX_BATCH_ITEMS = 512
 DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
@@ -3487,7 +3487,7 @@ def translate_srt(
                         options,
                         mode="srt_block",
                         rolling_context=context_hint,
-                        allow_partial=fast_mode,
+                        allow_partial=True,
                         max_split_depth=max_split_depth,
                     )
                     for item, candidate in zip(uncached_items, out):
@@ -3548,7 +3548,7 @@ def translate_srt(
                         target_lang,
                         options,
                         mode="srt_block",
-                        allow_partial=fast_mode,
+                        allow_partial=True,
                         max_split_depth=max_split_depth,
                     )
                     failed_items = [
@@ -3745,7 +3745,7 @@ def translate_ass(
                         options,
                         mode="ass_protected",
                         rolling_context=context_hint,
-                        allow_partial=fast_mode,
+                        allow_partial=True,
                         max_split_depth=max_split_depth,
                     )
                     for item, candidate in zip(uncached_items, out):
@@ -3810,7 +3810,7 @@ def translate_ass(
                             options,
                             mode="ass_protected",
                             format_mode="schema",
-                            allow_partial=fast_mode,
+                            allow_partial=True,
                             max_split_depth=max_split_depth,
                         )
                         failed_items = [
@@ -4545,7 +4545,14 @@ def apply_fast_profile(args, console) -> None:
     if args.num_ctx is None:
         args.num_ctx = 4096
     if args.num_threads is None:
-        args.num_threads = cpu_threads
+        workers = max(1, int(getattr(args, "parallel_files", 1) or 1))
+        if workers > 1:
+            # Evita sobre-suscripcion de CPU al correr varios archivos en paralelo.
+            args.num_threads = max(2, cpu_threads // workers)
+        else:
+            args.num_threads = cpu_threads
+    if args.format_mode == "auto":
+        args.format_mode = "schema"
     if args.rolling_context > 0:
         args.rolling_context = 0
     if not args.skip_summary:
@@ -5027,7 +5034,7 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.1, help="Temperatura del LLM")
     parser.add_argument("--num-predict", type=int, help="Limite de tokens generados por respuesta")
     parser.add_argument("--num-ctx", type=int, help="Ventana de contexto")
-    parser.add_argument("--num-threads", type=int, help="Hilos para ejecucion del modelo")
+    parser.add_argument("--num-threads", type=int, default=6, help="Hilos para ejecucion del modelo")
     parser.add_argument("--num-gpu", type=int, help="Capas GPU para ejecucion del modelo")
     parser.add_argument("--limit", type=int, help="Traduce solo los primeros N bloques de dialogo")
     parser.add_argument("--skip-summary", action="store_true", help="Omite el paso de resumen")
@@ -5036,12 +5043,25 @@ def main() -> int:
     parser.add_argument(
         "--parallel-files",
         type=int,
-        default=1,
+        default=3,
         help="Traduce multiples archivos en paralelo para --batch o modo multiarchivo (workers por subprocess)",
     )
     parser.add_argument("--overwrite", action="store_true", help="Sobrescribe salidas en modo --batch")
     parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="Modo de traduccion ASS")
-    parser.add_argument("--fast", action="store_true", help="Aplica valores predeterminados de perfil rapido")
+    fast_group = parser.add_mutually_exclusive_group()
+    fast_group.add_argument(
+        "--fast",
+        dest="fast",
+        action="store_true",
+        default=True,
+        help="Aplica valores predeterminados de perfil rapido (predeterminado: on)",
+    )
+    fast_group.add_argument(
+        "--no-fast",
+        dest="fast",
+        action="store_false",
+        help="Desactiva el perfil rapido predeterminado",
+    )
     parser.add_argument("--one-shot", action="store_true", help="Fuerza un solo lote cuando entra en contexto")
     parser.add_argument("--rolling-context", type=int, default=0, help="Usa las ultimas N lineas traducidas como contexto")
     parser.add_argument(

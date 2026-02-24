@@ -44,7 +44,7 @@ python traducir_subtitulos.py --interactive
 Modo directo:
 
 ```bash
-python traducir_subtitulos.py --in "archivo.ass" --target Spanish --model gemma3:4b --fast
+python traducir_subtitulos.py --in "archivo.ass" --target Spanish --model gemma3:4b
 ```
 
 Nota:
@@ -57,13 +57,15 @@ Opciones utiles:
 - `--out`: ruta de salida.
 - `--batch`: traduce en lote todos los `.ass/.srt` de `SUBS_BULK/`.
 - `--parallel-files N`: cantidad de archivos en paralelo en `--batch` o multi-seleccion (usa subprocesos).
+- `--num-threads N`: hilos para Ollama (`6` por defecto).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
 - En `--batch` y multi-seleccion ahora se imprime progreso global de archivos: `ok/skipped/failed/remaining`.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad.
 - `--limit N`: traduce solo los primeros N bloques.
-- `--fast`: aplica perfil rapido.
+- `--fast`: aplica perfil rapido (ahora activo por defecto).
+- `--no-fast`: desactiva el perfil rapido por defecto.
 - `--one-shot`: intenta traducir en un lote grande cuando el contexto lo permite.
 - `--bench`: imprime metricas detalladas de rendimiento por llamada.
 
@@ -89,14 +91,14 @@ En el resumen final veras, entre otros:
 
 Si Ollama usa una sola GPU con memoria limitada:
 
-- Usa `--fast --one-shot`.
-- Prueba `--parallel-files 2` como punto de equilibrio.
-- Evita `--parallel-files 3` o mas, suele empeorar por contencion.
+- El perfil rapido (`--fast`) ya viene activo por defecto y habilita `one-shot`.
+- `--parallel-files` ahora usa `3` por defecto.
+- Si notas contencion en otros modelos/equipos, prueba `--parallel-files 2`.
 
 Ejemplo de lote recomendado:
 
 ```bash
-python traducir_subtitulos.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish --fast --one-shot --parallel-files 2
+python traducir_subtitulos.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish
 ```
 
 Salida por defecto:
