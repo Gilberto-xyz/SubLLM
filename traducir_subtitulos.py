@@ -11,6 +11,7 @@ import argparse
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+import csv
 from difflib import SequenceMatcher
 import fnmatch
 import json
@@ -20,6 +21,7 @@ import socket
 import subprocess
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, List, Tuple, TypeVar
@@ -28,6 +30,8 @@ from urllib import request, error
 try:
     from rich.console import Console
     from rich.columns import Columns
+    from rich.live import Live
+    from rich.layout import Layout
     from rich.panel import Panel
     from rich.table import Table
     from rich import box
@@ -42,6 +46,14 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+try:
+    import psutil  # type: ignore
+except ImportError:
+    psutil = None
+
+
+BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
 
 
 ASS_TAG_RE = re.compile(r"(\{[^}]*\}|\\N|\\n|\\h)")
@@ -153,6 +165,418 @@ class DummyProgress:
 
     def update(self, task_id: int, **kwargs):
         return None
+
+
+class ResourceMonitor:
+    def __init__(self, interval_seconds: float = 1.0) -> None:
+        self.interval_seconds = max(0.5, float(interval_seconds or 1.0))
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._cpu_count = max(1, int(os.cpu_count() or 1))
+        self._latest = {
+            "source": "none",
+            "sys_cpu_pct": None,
+            "sys_ram_used_gb": None,
+            "ollama_cpu_pct": None,
+            "ollama_ram_gb": None,
+            "ollama_pids": 0,
+            "gpu_util_pct": None,
+            "gpu_mem_used_gb": None,
+            "gpu_mem_total_gb": None,
+            "samples": 0,
+            "errors": 0,
+            "last_error": "",
+        }
+        self._prev_ollama_cpu: dict[int, float] = {}
+        self._prev_ts: float | None = None
+        self._prev_sys_idle: int | None = None
+        self._prev_sys_kernel: int | None = None
+        self._prev_sys_user: int | None = None
+        self._last_gpu_poll: float = 0.0
+        self._last_gpu_metrics: Tuple[float | None, float | None, float | None] = (None, None, None)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="resource-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def latest(self) -> dict:
+        with self._lock:
+            return dict(self._latest)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            start = time.perf_counter()
+            try:
+                snapshot = self._collect_snapshot()
+            except Exception as exc:
+                with self._lock:
+                    self._latest["errors"] = int(self._latest.get("errors", 0) or 0) + 1
+                    self._latest["last_error"] = str(exc)
+                snapshot = None
+
+            if snapshot is not None:
+                with self._lock:
+                    self._latest.update(snapshot)
+                    self._latest["samples"] = int(self._latest.get("samples", 0) or 0) + 1
+
+            elapsed = time.perf_counter() - start
+            sleep_for = max(0.05, self.interval_seconds - elapsed)
+            self._stop_event.wait(sleep_for)
+
+    def _collect_snapshot(self) -> dict | None:
+        if psutil is not None:
+            data = self._collect_with_psutil()
+            if data is not None:
+                return data
+        if os.name == "nt":
+            data = self._collect_with_windows_tools()
+            if data is not None:
+                return data
+        return self._collect_basic_snapshot()
+
+    def _collect_with_psutil(self) -> dict | None:
+        if psutil is None:
+            return None
+        now = time.perf_counter()
+        vm = psutil.virtual_memory()
+        sys_ram_used = (float(vm.total) - float(vm.available)) / BYTES_PER_GB
+        sys_cpu = float(psutil.cpu_percent(interval=None))
+
+        ollama_procs = []
+        for proc in psutil.process_iter(attrs=["pid", "name", "memory_info", "cpu_times"]):
+            name = str(proc.info.get("name", "")).lower()
+            if "ollama" not in name:
+                continue
+            ollama_procs.append(proc.info)
+
+        pids: list[int] = []
+        ollama_ram_gb = 0.0
+        current_cpu: dict[int, float] = {}
+        for info in ollama_procs:
+            pid = int(info.get("pid") or 0)
+            if pid <= 0:
+                continue
+            pids.append(pid)
+            mem_info = info.get("memory_info")
+            if mem_info is not None:
+                rss = float(getattr(mem_info, "rss", 0.0) or 0.0)
+                ollama_ram_gb += rss / BYTES_PER_GB
+            cpu_times = info.get("cpu_times")
+            if cpu_times is not None:
+                current_cpu[pid] = float(getattr(cpu_times, "user", 0.0) or 0.0) + float(
+                    getattr(cpu_times, "system", 0.0) or 0.0
+                )
+
+        ollama_cpu_pct = None
+        if self._prev_ts is not None and now > self._prev_ts and current_cpu:
+            dt = now - self._prev_ts
+            delta = 0.0
+            for pid, cpu_sec in current_cpu.items():
+                prev = self._prev_ollama_cpu.get(pid)
+                if prev is None:
+                    continue
+                if cpu_sec >= prev:
+                    delta += cpu_sec - prev
+            ollama_cpu_pct = max(0.0, (delta / dt) * 100.0 / float(self._cpu_count))
+        self._prev_ollama_cpu = current_cpu
+        self._prev_ts = now
+
+        gpu_util, gpu_mem_used, gpu_mem_total = self._read_nvidia_gpu_metrics()
+        return {
+            "source": "psutil",
+            "sys_cpu_pct": sys_cpu,
+            "sys_ram_used_gb": sys_ram_used,
+            "ollama_cpu_pct": ollama_cpu_pct,
+            "ollama_ram_gb": ollama_ram_gb,
+            "ollama_pids": len(pids),
+            "gpu_util_pct": gpu_util,
+            "gpu_mem_used_gb": gpu_mem_used,
+            "gpu_mem_total_gb": gpu_mem_total,
+            "last_error": "",
+        }
+
+    def _collect_with_windows_tools(self) -> dict | None:
+        now = time.perf_counter()
+        sys_cpu = self._windows_system_cpu_pct()
+        sys_ram_used = self._windows_memory_used_gb()
+        rows = self._poll_windows_tasklist_snapshot()
+        current_cpu: dict[int, float] = {}
+        ollama_ram_gb = 0.0
+        for row in rows:
+            pid = self._safe_int(row.get("pid"))
+            if pid <= 0:
+                continue
+            current_cpu[pid] = self._safe_float(row.get("cpu_seconds")) or 0.0
+            ws_bytes = self._safe_float(row.get("mem_bytes")) or 0.0
+            ollama_ram_gb += ws_bytes / BYTES_PER_GB
+
+        ollama_cpu_pct = None
+        if self._prev_ts is not None and now > self._prev_ts and current_cpu:
+            dt = now - self._prev_ts
+            delta = 0.0
+            for pid, cpu_sec in current_cpu.items():
+                prev = self._prev_ollama_cpu.get(pid)
+                if prev is None:
+                    continue
+                if cpu_sec >= prev:
+                    delta += cpu_sec - prev
+            ollama_cpu_pct = max(0.0, (delta / dt) * 100.0 / float(self._cpu_count))
+        self._prev_ollama_cpu = current_cpu
+        self._prev_ts = now
+
+        gpu_util, gpu_mem_used, gpu_mem_total = self._read_nvidia_gpu_metrics()
+
+        return {
+            "source": "windows-native",
+            "sys_cpu_pct": sys_cpu,
+            "sys_ram_used_gb": sys_ram_used,
+            "ollama_cpu_pct": ollama_cpu_pct,
+            "ollama_ram_gb": ollama_ram_gb,
+            "ollama_pids": len(current_cpu),
+            "gpu_util_pct": gpu_util,
+            "gpu_mem_used_gb": gpu_mem_used,
+            "gpu_mem_total_gb": gpu_mem_total,
+            "last_error": "",
+        }
+
+    def _poll_windows_tasklist_snapshot(self) -> list[dict]:
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq ollama.exe", "/FO", "CSV", "/NH", "/V"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1.0,
+                check=False,
+            )
+        except Exception:
+            return []
+        if proc.returncode != 0:
+            return []
+        output = (proc.stdout or "").strip()
+        if not output:
+            return []
+
+        rows = []
+        reader = csv.reader(output.splitlines())
+        for cols in reader:
+            if not cols or len(cols) < 8:
+                continue
+            pid = self._safe_int(cols[1])
+            if pid <= 0:
+                continue
+            mem_text = str(cols[4]).strip()
+            digits = re.sub(r"[^\d]", "", mem_text)
+            mem_kb = self._safe_int(digits)
+            cpu_seconds = self._parse_windows_cpu_time(str(cols[7]).strip())
+            rows.append(
+                {
+                    "pid": pid,
+                    "cpu_seconds": float(cpu_seconds),
+                    "mem_bytes": float(mem_kb) * 1024.0,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _parse_windows_cpu_time(value: str) -> int:
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        days = 0
+        clock = text
+        if "." in text:
+            day_part, _, rest = text.partition(".")
+            if day_part.isdigit():
+                days = int(day_part)
+                clock = rest
+        parts = clock.split(":")
+        if len(parts) != 3:
+            return 0
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+        except Exception:
+            return 0
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    def _windows_memory_used_gb(self) -> float | None:
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+        except Exception:
+            return None
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        used = float(status.ullTotalPhys - status.ullAvailPhys) / BYTES_PER_GB
+        return max(0.0, used)
+
+    def _windows_system_cpu_pct(self) -> float | None:
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+        except Exception:
+            return None
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", ctypes.c_ulong),
+                ("dwHighDateTime", ctypes.c_ulong),
+            ]
+
+        idle = FILETIME()
+        kernel = FILETIME()
+        user = FILETIME()
+        if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+
+        def _to_int(filetime: FILETIME) -> int:
+            return (int(filetime.dwHighDateTime) << 32) | int(filetime.dwLowDateTime)
+
+        idle_now = _to_int(idle)
+        kernel_now = _to_int(kernel)
+        user_now = _to_int(user)
+
+        if self._prev_sys_idle is None or self._prev_sys_kernel is None or self._prev_sys_user is None:
+            self._prev_sys_idle = idle_now
+            self._prev_sys_kernel = kernel_now
+            self._prev_sys_user = user_now
+            return None
+
+        idle_delta = idle_now - self._prev_sys_idle
+        kernel_delta = kernel_now - self._prev_sys_kernel
+        user_delta = user_now - self._prev_sys_user
+        self._prev_sys_idle = idle_now
+        self._prev_sys_kernel = kernel_now
+        self._prev_sys_user = user_now
+
+        total = kernel_delta + user_delta
+        if total <= 0:
+            return None
+        busy = total - idle_delta
+        return max(0.0, min(100.0, (float(busy) / float(total)) * 100.0))
+
+    def _collect_basic_snapshot(self) -> dict:
+        return {
+            "source": "basic",
+            "sys_cpu_pct": None,
+            "sys_ram_used_gb": None,
+            "ollama_cpu_pct": None,
+            "ollama_ram_gb": None,
+            "ollama_pids": 0,
+            "gpu_util_pct": None,
+            "gpu_mem_used_gb": None,
+            "gpu_mem_total_gb": None,
+            "last_error": "monitor limitado",
+        }
+
+    def _read_nvidia_gpu_metrics(self) -> Tuple[float | None, float | None, float | None]:
+        now = time.perf_counter()
+        if now - self._last_gpu_poll < 2.0:
+            return self._last_gpu_metrics
+
+        util = None
+        mem_used = None
+        mem_total = None
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                util_values: list[float] = []
+                used_values: list[float] = []
+                total_values: list[float] = []
+                for raw_line in (proc.stdout or "").splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    parts = [segment.strip() for segment in line.split(",")]
+                    if len(parts) < 3:
+                        continue
+                    util_candidate = self._safe_float(parts[0])
+                    used_candidate = self._safe_float(parts[1])
+                    total_candidate = self._safe_float(parts[2])
+                    if util_candidate is not None:
+                        util_values.append(util_candidate)
+                    if used_candidate is not None:
+                        used_values.append(used_candidate)
+                    if total_candidate is not None:
+                        total_values.append(total_candidate)
+                if util_values:
+                    util = sum(util_values) / float(len(util_values))
+                if used_values:
+                    mem_used = sum(used_values) / 1024.0
+                if total_values:
+                    mem_total = sum(total_values) / 1024.0
+        except Exception:
+            pass
+
+        self._last_gpu_poll = now
+        self._last_gpu_metrics = (util, mem_used, mem_total)
+        return self._last_gpu_metrics
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return int(value)
+        except Exception:
+            return 0
 
 
 def get_console():
@@ -293,95 +717,81 @@ def print_multi_file_final_summary(
     cache_rate_text = "-"
     if cache_lookups_sum > 0:
         cache_rate_text = f"{(cache_hits_sum / float(cache_lookups_sum)) * 100.0:.1f}%"
-
-    metrics = [
-        ("Seleccionados", str(selected_total), None),
-        ("A procesar", str(to_process), None),
-        ("Procesados", str(processed), None),
-        ("OK", str(ok), None),
-        ("Omitidos", str(skipped), None),
-        ("Fallidos", str(failed), None),
-        ("Bloques traducidos", str(translated_blocks_sum), None),
-        ("Tiempo traduciendo", f"{translate_elapsed_sum:.1f}s", format_duration_compact(translate_elapsed_sum)),
-    ]
-    if wall_elapsed is not None:
-        metrics.append(("Tiempo real de pared", f"{wall_elapsed:.1f}s", format_duration_compact(wall_elapsed)))
-        metrics.append(
-            (
-                "Tiempo total acumulado",
-                f"{total_elapsed_sum:.1f}s",
-                f"{format_duration_compact(total_elapsed_sum)} (suma de procesos)",
-            )
-        )
-    else:
-        metrics.append(("Tiempo total acumulado", f"{total_elapsed_sum:.1f}s", format_duration_compact(total_elapsed_sum)))
-    metrics.append(("Cache hit global", cache_rate_text, f"aciertos={cache_hits_sum}, no_en_cache={cache_misses_sum}"))
-
-    show_metrics_cards(
-        console,
-        metrics,
-        title=title,
-        columns=3,
-    )
-
-    if not file_results:
-        return
+    avg_per_ok = total_elapsed_sum / float(max(1, len(ok_results)))
+    wall_text = "-" if wall_elapsed is None else f"{wall_elapsed:.1f}s ({format_duration_compact(wall_elapsed)})"
+    accumulated_text = f"{total_elapsed_sum:.1f}s ({format_duration_compact(total_elapsed_sum)})"
+    avg_text = f"{avg_per_ok:.1f}s" if ok_results else "-"
 
     if not RICH_AVAILABLE:
-        console.print("Detalle por archivo:")
-        for row in file_results:
-            file_name = row.get("file_name", "?")
-            status = "OK" if int(row.get("code", 1)) == 0 else f"ERROR({row.get('code', 1)})"
-            blocks = row.get("translated_blocks")
-            blocks_text = str(blocks) if blocks is not None else "-"
-            tr_sec = row.get("translate_elapsed")
-            tr_text = f"{float(tr_sec):.1f}s" if isinstance(tr_sec, (int, float)) and tr_sec > 0 else "-"
-            tot_sec = row.get("total_elapsed")
-            tot_text = f"{float(tot_sec):.1f}s" if isinstance(tot_sec, (int, float)) and tot_sec > 0 else "-"
-            cache_hits = int(row.get("cache_hits", 0) or 0)
-            cache_misses = int(row.get("cache_misses", 0) or 0)
-            lookups = cache_hits + cache_misses
-            if lookups > 0:
-                cache_text = f"{cache_hits}/{lookups} ({(cache_hits / float(lookups)) * 100.0:.1f}%)"
-            else:
-                cache_text = "-"
-            console.print(
-                f"- {file_name} | estado={status} | bloques={blocks_text} | trad={tr_text} | total={tot_text} | cache={cache_text}"
+        cprint(console, title, "bold cyan")
+        console.print(
+            (
+                f"sel={selected_total} proc={to_process} done={processed} ok={ok} "
+                f"omitidos={skipped} fallidos={failed} bloques={translated_blocks_sum}"
             )
+        )
+        console.print(f"pared={wall_text} | acumulado={accumulated_text} | prom_ok={avg_text} | cache={cache_rate_text}")
+        if failed > 0:
+            failed_names = [str(row.get("file_name", "?")) for row in file_results if int(row.get("code", 1)) != 0]
+            if failed_names:
+                console.print("Fallidos: " + ", ".join(failed_names))
         return
 
-    table = Table(
-        title="Detalle por archivo",
-        box=box.SIMPLE_HEAVY,
+    summary_table = Table(
+        show_header=True,
         header_style="bold cyan",
-        show_lines=False,
+        box=box.SIMPLE_HEAVY,
         expand=True,
     )
-    table.add_column("Archivo", overflow="fold")
-    table.add_column("Estado", justify="center", no_wrap=True)
-    table.add_column("Bloques", justify="right", no_wrap=True)
-    table.add_column("Trad.", justify="right", no_wrap=True)
-    table.add_column("Total", justify="right", no_wrap=True)
-    table.add_column("Cache", justify="right", no_wrap=True)
-    for row in file_results:
-        file_name = row.get("file_name", "?")
-        code = int(row.get("code", 1))
-        status = "[bold green]OK[/bold green]" if code == 0 else f"[bold red]ERROR({code})[/bold red]"
-        blocks = row.get("translated_blocks")
-        blocks_text = str(blocks) if blocks is not None else "-"
-        tr_sec = row.get("translate_elapsed")
-        tr_text = f"{float(tr_sec):.1f}s" if isinstance(tr_sec, (int, float)) and tr_sec > 0 else "-"
-        tot_sec = row.get("total_elapsed")
-        tot_text = f"{float(tot_sec):.1f}s" if isinstance(tot_sec, (int, float)) and tot_sec > 0 else "-"
-        cache_hits = int(row.get("cache_hits", 0) or 0)
-        cache_misses = int(row.get("cache_misses", 0) or 0)
-        lookups = cache_hits + cache_misses
-        if lookups > 0:
-            cache_text = f"{cache_hits}/{lookups} ({(cache_hits / float(lookups)) * 100.0:.1f}%)"
-        else:
-            cache_text = "-"
-        table.add_row(file_name, status, blocks_text, tr_text, tot_text, cache_text)
-    console.print(table)
+    summary_table.add_column("Sel", justify="right", no_wrap=True)
+    summary_table.add_column("Proc", justify="right", no_wrap=True)
+    summary_table.add_column("OK", justify="right", no_wrap=True)
+    summary_table.add_column("Omit.", justify="right", no_wrap=True)
+    summary_table.add_column("Fail", justify="right", no_wrap=True)
+    summary_table.add_column("Pared", justify="right", no_wrap=True)
+    summary_table.add_column("Acum", justify="right", no_wrap=True)
+    summary_table.add_column("Cache", justify="right", no_wrap=True)
+    summary_table.add_row(
+        str(selected_total),
+        str(to_process),
+        f"[bold green]{ok}[/bold green]" if ok > 0 else "0",
+        str(skipped),
+        f"[bold red]{failed}[/bold red]" if failed > 0 else "0",
+        wall_text,
+        accumulated_text,
+        cache_rate_text,
+    )
+    summary_table.caption = (
+        f"done={processed} | bloques={translated_blocks_sum} | "
+        f"trad_total={translate_elapsed_sum:.1f}s | prom_ok={avg_text}"
+    )
+    console.print(
+        Panel(
+            summary_table,
+            title=title,
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+    )
+
+    if failed > 0:
+        failed_table = Table(
+            title="Archivos con error",
+            box=box.SIMPLE_HEAVY,
+            header_style="bold red",
+            show_lines=False,
+            expand=True,
+        )
+        failed_table.add_column("Archivo", overflow="fold")
+        failed_table.add_column("Codigo", justify="right", no_wrap=True)
+        for row in file_results:
+            code = int(row.get("code", 1))
+            if code == 0:
+                continue
+            failed_table.add_row(str(row.get("file_name", "?")), str(code))
+        console.print(failed_table)
 
 
 def show_execution_roadmap(
@@ -470,17 +880,25 @@ class GlobalProgressTracker:
         self.skipped = max(0, int(skipped or 0))
         self.failed = 0
         self._enabled = bool(RICH_AVAILABLE)
+        self._state_lock = threading.Lock()
         self._progress = None
+        self._live = None
+        self._resource_monitor = ResourceMonitor(interval_seconds=1.0)
         self._global_task_id = None
         self._file_task_id = None
         self._stage_task_id = None
         self._stage_total = 1
         self._stage_completed = 0
+        self._events: list[Tuple[str, str, str]] = []
+        self._parallel_workers = 0
+        self._parallel_total = 0
+        self._parallel_done = 0
 
     def __enter__(self):
         if not self._enabled:
             return self
         self._progress = Progress(
+            SpinnerColumn(),
             TextColumn("{task.description}"),
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
@@ -499,9 +917,22 @@ class GlobalProgressTracker:
         )
         self._file_task_id = self._progress.add_task("Archivo: esperando...", total=1, completed=0)
         self._stage_task_id = self._progress.add_task("Etapa: esperando...", total=1, completed=0)
+        self._resource_monitor.start()
+        self._live = Live(
+            self._build_layout(),
+            console=self.console,
+            refresh_per_second=4,
+            transient=False,
+        )
+        self._live.start()
+        self.log_event("Panel dinamico activo (progreso + recursos).", "bold cyan")
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self._resource_monitor.stop()
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
         if self._progress is not None:
             self._progress.stop()
         return False
@@ -510,7 +941,128 @@ class GlobalProgressTracker:
         return f"General | ok={self.ok}, omitidos={self.skipped}, fallidos={self.failed}"
 
     def _is_ready(self) -> bool:
-        return bool(self._enabled and self._progress is not None)
+        return bool(self._enabled and self._progress is not None and self._live is not None)
+
+    def _refresh_live(self) -> None:
+        if not self._is_ready():
+            return
+        self._live.update(self._build_layout(), refresh=True)
+
+    @staticmethod
+    def _fmt_pct(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.1f}%"
+
+    @staticmethod
+    def _fmt_gb(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.2f} GB"
+
+    def _render_resource_panel(self):
+        snapshot = self._resource_monitor.latest()
+        table = Table(
+            show_header=False,
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            pad_edge=False,
+        )
+        table.add_column("Metrica", style="bold cyan")
+        table.add_column("Valor", justify="right", style="white")
+        table.add_row("Fuente", str(snapshot.get("source", "-")))
+        table.add_row("CPU sistema", self._fmt_pct(self._safe_float(snapshot.get("sys_cpu_pct"))))
+        table.add_row("RAM sistema", self._fmt_gb(self._safe_float(snapshot.get("sys_ram_used_gb"))))
+        table.add_row("CPU ollama", self._fmt_pct(self._safe_float(snapshot.get("ollama_cpu_pct"))))
+        table.add_row("RAM ollama", self._fmt_gb(self._safe_float(snapshot.get("ollama_ram_gb"))))
+        table.add_row("PIDs ollama", str(int(snapshot.get("ollama_pids", 0) or 0)))
+        gpu_util = self._safe_float(snapshot.get("gpu_util_pct"))
+        gpu_mem_used = self._safe_float(snapshot.get("gpu_mem_used_gb"))
+        gpu_mem_total = self._safe_float(snapshot.get("gpu_mem_total_gb"))
+        gpu_mem = "-"
+        if gpu_mem_used is not None:
+            if gpu_mem_total is not None and gpu_mem_total > 0:
+                gpu_mem = f"{gpu_mem_used:.2f}/{gpu_mem_total:.2f} GB"
+            else:
+                gpu_mem = f"{gpu_mem_used:.2f} GB"
+        table.add_row("GPU util", self._fmt_pct(gpu_util))
+        table.add_row("GPU memoria", gpu_mem)
+        errors = int(snapshot.get("errors", 0) or 0)
+        if errors > 0:
+            table.add_row("Monitor", f"[yellow]fallos={errors}[/yellow]")
+
+        return Panel(
+            table,
+            title="Recursos",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+
+    def _render_events_panel(self):
+        table = Table(
+            show_header=True,
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+            expand=True,
+        )
+        table.add_column("Hora", justify="right", no_wrap=True, width=8)
+        table.add_column("Evento", overflow="fold")
+        if not self._events:
+            table.add_row("-", "[dim]Esperando actividad...[/dim]")
+        else:
+            for ts, message, style in self._events[-6:]:
+                table.add_row(ts, f"[{style}]{message}[/{style}]")
+        return Panel(
+            table,
+            title="Actividad",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+
+    def _build_layout(self):
+        top = Layout(name="top")
+        top.split_row(
+            Layout(
+                Panel(
+                    self._progress,
+                    title="Progreso",
+                    border_style="bright_blue",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                    expand=True,
+                ),
+                ratio=2,
+                name="progress",
+            ),
+            Layout(self._render_resource_panel(), ratio=1, name="resources"),
+        )
+        root = Layout(name="root")
+        root.split_column(
+            Layout(top, ratio=3, name="top"),
+            Layout(self._render_events_panel(), ratio=2, name="events"),
+        )
+        return root
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def log_event(self, message: str, style: str = "white") -> None:
+        now = time.strftime("%H:%M:%S")
+        with self._state_lock:
+            self._events.append((now, str(message), style))
+            if len(self._events) > 12:
+                self._events = self._events[-12:]
+            self._refresh_live()
 
     def start_file(self, file_path: Path, file_index: int, total_files: int, include_summary: bool) -> None:
         if not self._is_ready():
@@ -533,6 +1085,10 @@ class GlobalProgressTracker:
         )
         self._stage_total = 1
         self._stage_completed = 0
+        self._parallel_workers = 0
+        self._parallel_total = 0
+        self._parallel_done = 0
+        self.log_event(f"Iniciando archivo {file_index}/{total_files}: {file_path.name}", "cyan")
 
     def stage_start(self, stage_key: str, total: int) -> None:
         if not self._is_ready():
@@ -546,6 +1102,7 @@ class GlobalProgressTracker:
         )
         self._stage_total = max(1, int(total or 1))
         self._stage_completed = 0
+        self._refresh_live()
 
     def stage_advance(self, amount: int = 1) -> None:
         if not self._is_ready():
@@ -553,6 +1110,7 @@ class GlobalProgressTracker:
         safe_amount = max(0, int(amount))
         self._stage_completed = min(self._stage_total, self._stage_completed + safe_amount)
         self._progress.update(self._stage_task_id, completed=self._stage_completed)
+        self._refresh_live()
 
     def stage_done(self) -> None:
         if not self._is_ready():
@@ -561,6 +1119,48 @@ class GlobalProgressTracker:
             self._progress.update(self._stage_task_id, completed=self._stage_total)
             self._stage_completed = self._stage_total
         self._progress.advance(self._file_task_id, 1)
+        self._refresh_live()
+
+    def set_parallel_mode(self, workers: int, total_jobs: int) -> None:
+        if not self._is_ready():
+            return
+        self._parallel_workers = max(1, int(workers or 1))
+        self._parallel_total = max(1, int(total_jobs or 1))
+        self._parallel_done = 0
+        self._progress.update(
+            self._file_task_id,
+            description=f"Paralelo: 0/{self._parallel_total} archivos completados",
+            total=self._parallel_total,
+            completed=0,
+        )
+        self._progress.update(
+            self._stage_task_id,
+            description=f"Etapa: subprocesos ({self._parallel_workers} workers)",
+            total=self._parallel_total,
+            completed=0,
+        )
+        self.log_event(
+            f"Modo paralelo activo: workers={self._parallel_workers}, trabajos={self._parallel_total}.",
+            "bold cyan",
+        )
+
+    def update_parallel_progress(self, done: int) -> None:
+        if not self._is_ready():
+            return
+        self._parallel_done = min(self._parallel_total, max(0, int(done)))
+        self._progress.update(
+            self._file_task_id,
+            description=f"Paralelo: {self._parallel_done}/{self._parallel_total} archivos completados",
+            total=self._parallel_total,
+            completed=self._parallel_done,
+        )
+        self._progress.update(
+            self._stage_task_id,
+            description=f"Etapa: subprocesos ({self._parallel_workers} workers)",
+            total=self._parallel_total,
+            completed=self._parallel_done,
+        )
+        self._refresh_live()
 
     def set_counts(self, ok: int, skipped: int, failed: int) -> None:
         self.ok = max(0, int(ok))
@@ -574,6 +1174,7 @@ class GlobalProgressTracker:
             description=self._global_desc(),
             completed=done,
         )
+        self._refresh_live()
 
 
 class RuntimeMetrics:
@@ -4632,6 +5233,7 @@ def build_single_file_subprocess_cmd(args, in_path: Path, out_path: Path) -> Lis
         str(args.format_mode),
         "--parallel-files",
         "1",
+        "--child-run",
     ]
     if args.num_predict is not None:
         cmd.extend(["--num-predict", str(args.num_predict)])
@@ -4697,6 +5299,34 @@ def extract_translation_summary(output: str) -> str:
     return " | ".join(selected)
 
 
+def extract_translation_stats(output: str) -> dict:
+    stats = {
+        "translated_blocks": None,
+        "translate_elapsed": None,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
+    if not output:
+        return stats
+
+    blocks_match = re.search(r"Bloques traducidos:\s*(\d+)", output)
+    if blocks_match:
+        stats["translated_blocks"] = int(blocks_match.group(1))
+
+    elapsed_match = re.search(r"Tiempo \(traduccion\):\s*([0-9]+(?:\.[0-9]+)?)s", output)
+    if elapsed_match:
+        stats["translate_elapsed"] = float(elapsed_match.group(1))
+
+    cache_match = re.search(
+        r"Cache de traduccion:\s*consultas=\d+,\s*aciertos=(\d+),\s*no_en_cache=(\d+)",
+        output,
+    )
+    if cache_match:
+        stats["cache_hits"] = int(cache_match.group(1))
+        stats["cache_misses"] = int(cache_match.group(2))
+    return stats
+
+
 def format_global_file_progress(done: int, total: int, ok: int, skipped: int, failed: int) -> str:
     if total <= 0:
         pct = 100.0
@@ -4721,22 +5351,26 @@ def translate_many_files_parallel_subprocess(
     jobs: List[Tuple[Path, Path]],
     selected_total: int,
     skipped: int = 0,
+    progress_tracker: GlobalProgressTracker | None = None,
 ) -> Tuple[int, int, List[dict]]:
     max_workers = max(1, int(args.parallel_files or 1))
     total = len(jobs)
-    cprint(
-        console,
-        f"Modo paralelo de archivos: workers={max_workers}, trabajos={total}, seleccionados={selected_total}",
-        "bold cyan",
-    )
+    if progress_tracker is not None:
+        progress_tracker.set_parallel_mode(max_workers, total)
+    else:
+        cprint(
+            console,
+            f"Modo paralelo de archivos: workers={max_workers}, trabajos={total}, seleccionados={selected_total}",
+            "bold cyan",
+        )
     ok = 0
     failed = 0
     done = 0
     file_results: List[dict] = []
-    progress_ctx = progress_bar(console) if RICH_AVAILABLE else DummyProgress()
+    progress_ctx = DummyProgress() if progress_tracker is not None else (progress_bar(console) if RICH_AVAILABLE else DummyProgress())
     with progress_ctx as progress:
         progress_task_id = None
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and progress_tracker is None:
             progress_task_id = progress.add_task(
                 f"Archivos | ok={ok}, omitidos={skipped}, fallidos={failed}",
                 total=max(1, selected_total),
@@ -4768,28 +5402,38 @@ def translate_many_files_parallel_subprocess(
                             "cache_writes": 0,
                         }
                     )
-                    cprint(console, f"[{done}/{total}] ERROR {in_path.name}: {exc}", "bold red")
+                    message = f"[{done}/{total}] ERROR {in_path.name}: {exc}"
+                    if progress_tracker is not None:
+                        progress_tracker.log_event(message, "bold red")
+                    else:
+                        cprint(console, message, "bold red")
                 else:
                     if code == 0:
                         ok += 1
                         summary = extract_translation_summary(output)
+                        parsed_stats = extract_translation_stats(output)
                         file_results.append(
                             {
                                 "file_path": in_path,
                                 "file_name": in_path.name,
                                 "out_path": None,
                                 "code": 0,
-                                "translated_blocks": None,
-                                "translate_elapsed": None,
+                                "translated_blocks": parsed_stats.get("translated_blocks"),
+                                "translate_elapsed": parsed_stats.get("translate_elapsed"),
                                 "total_elapsed": float(elapsed),
-                                "cache_hits": 0,
-                                "cache_misses": 0,
+                                "cache_hits": int(parsed_stats.get("cache_hits", 0) or 0),
+                                "cache_misses": int(parsed_stats.get("cache_misses", 0) or 0),
                                 "cache_writes": 0,
                             }
                         )
-                        cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
-                        if summary:
-                            console.print(summary)
+                        if progress_tracker is not None:
+                            progress_tracker.log_event(f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
+                            if summary:
+                                progress_tracker.log_event(summary, "dim")
+                        else:
+                            cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
+                            if summary:
+                                console.print(summary)
                     else:
                         failed += 1
                         file_results.append(
@@ -4806,13 +5450,23 @@ def translate_many_files_parallel_subprocess(
                                 "cache_writes": 0,
                             }
                         )
-                        cprint(console, f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
-                        if output.strip():
-                            tail = "\n".join(output.splitlines()[-30:])
-                            console.print(tail)
+                        message = f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)"
+                        if progress_tracker is not None:
+                            progress_tracker.log_event(message, "bold red")
+                            if output.strip():
+                                tail = "\n".join(output.splitlines()[-5:])
+                                progress_tracker.log_event(tail, "red")
+                        else:
+                            cprint(console, message, "bold red")
+                            if output.strip():
+                                tail = "\n".join(output.splitlines()[-30:])
+                                console.print(tail)
 
                 current_done = min(selected_total, skipped + done)
-                if RICH_AVAILABLE and progress_task_id is not None:
+                if progress_tracker is not None:
+                    progress_tracker.set_counts(ok, skipped, failed)
+                    progress_tracker.update_parallel_progress(done)
+                elif RICH_AVAILABLE and progress_task_id is not None:
                     progress.update(
                         progress_task_id,
                         description=f"Archivos | ok={ok}, omitidos={skipped}, fallidos={failed}",
@@ -4948,11 +5602,17 @@ def translate_single_file(
     write_text(out_path, out_text.splitlines(), line_ending, final_newline, bom)
     translate_elapsed = RUNTIME_METRICS.seconds.get("stage.translate", 0.0)
     total_elapsed = time.perf_counter() - start_total
-    cprint(console, f"Bloques traducidos: {translated_count}", "bold green")
-    cprint(console, f"Archivo generado: {out_path}", "bold green")
-    cprint(console, f"Tiempo (traduccion): {translate_elapsed:.1f}s", "bold green")
-    cprint(console, f"Tiempo (total): {total_elapsed:.1f}s", "bold green")
-    print_runtime_breakdown(console, total_elapsed)
+    if progress_tracker is not None:
+        progress_tracker.log_event(
+            f"OK {in_path.name}: bloques={translated_count}, trad={translate_elapsed:.1f}s, total={total_elapsed:.1f}s",
+            "bold green",
+        )
+    else:
+        cprint(console, f"Bloques traducidos: {translated_count}", "bold green")
+        cprint(console, f"Archivo generado: {out_path}", "bold green")
+        cprint(console, f"Tiempo (traduccion): {translate_elapsed:.1f}s", "bold green")
+        cprint(console, f"Tiempo (total): {total_elapsed:.1f}s", "bold green")
+        print_runtime_breakdown(console, total_elapsed)
     file_stats["code"] = 0
     file_stats["translated_blocks"] = int(translated_count)
     file_stats["translate_elapsed"] = float(translate_elapsed)
@@ -4974,21 +5634,19 @@ def run_multi_file_jobs(
     ok = 0
     failed = 0
     file_results: List[dict] = []
-    if args.parallel_files > 1 and len(jobs) > 1:
-        if selected_total > 1:
-            print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
-        return translate_many_files_parallel_subprocess(
-            console,
-            args,
-            jobs,
-            selected_total=selected_total,
-            skipped=skipped,
-        )
-
     use_persistent = RICH_AVAILABLE and selected_total > 1
     if use_persistent:
         with GlobalProgressTracker(console, selected_total, skipped=skipped) as tracker:
             tracker.set_counts(ok, skipped, failed)
+            if args.parallel_files > 1 and len(jobs) > 1:
+                return translate_many_files_parallel_subprocess(
+                    console,
+                    args,
+                    jobs,
+                    selected_total=selected_total,
+                    skipped=skipped,
+                    progress_tracker=tracker,
+                )
             for file_path, out_file in jobs:
                 next_global = skipped + ok + failed + 1
                 tracker.start_file(
@@ -5012,6 +5670,17 @@ def run_multi_file_jobs(
                     failed += 1
                 tracker.set_counts(ok, skipped, failed)
         return ok, failed, file_results
+
+    if args.parallel_files > 1 and len(jobs) > 1:
+        if selected_total > 1:
+            print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
+        return translate_many_files_parallel_subprocess(
+            console,
+            args,
+            jobs,
+            selected_total=selected_total,
+            skipped=skipped,
+        )
 
     if selected_total > 1:
         print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
@@ -5106,6 +5775,7 @@ def main() -> int:
     )
     parser.add_argument("--bench", action="store_true", help="Activa logs detallados de bench por llamada")
     parser.add_argument("--self-test", action="store_true", help="Ejecuta auto-pruebas internas y sale")
+    parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     set_runtime_flags(args.format_mode, args.minify_json, args.bench)
 
@@ -5295,22 +5965,45 @@ def main() -> int:
     in_path = in_paths[0]
     if out_path is None:
         out_path = build_output_path(in_path, args.target)
-    show_metrics_cards(
-        console,
-        [
-            ("Entrada", in_path.name, None),
-            ("Salida", out_path.name, None),
-            ("Modo", "Muestra" if args.limit is not None else "Completo", None),
-        ],
-        title="Ejecucion de archivo unico",
-        columns=3,
-    )
-    show_execution_roadmap(
-        console,
-        include_summary=(not args.skip_summary),
-        multi_file=False,
-    )
-    code, _stats = translate_single_file(client, console, args, in_path, out_path)
+    if not args.child_run:
+        show_metrics_cards(
+            console,
+            [
+                ("Entrada", in_path.name, None),
+                ("Salida", out_path.name, None),
+                ("Modo", "Muestra" if args.limit is not None else "Completo", None),
+            ],
+            title="Ejecucion de archivo unico",
+            columns=3,
+        )
+        show_execution_roadmap(
+            console,
+            include_summary=(not args.skip_summary),
+            multi_file=False,
+        )
+    if RICH_AVAILABLE and not args.child_run:
+        with GlobalProgressTracker(console, 1, skipped=0) as tracker:
+            tracker.set_counts(0, 0, 0)
+            tracker.start_file(
+                in_path,
+                1,
+                1,
+                include_summary=(not args.skip_summary),
+            )
+            code, _stats = translate_single_file(
+                client,
+                console,
+                args,
+                in_path,
+                out_path,
+                progress_tracker=tracker,
+            )
+            if code == 0:
+                tracker.set_counts(1, 0, 0)
+            else:
+                tracker.set_counts(0, 0, 1)
+    else:
+        code, _stats = translate_single_file(client, console, args, in_path, out_path)
     return code
 
 

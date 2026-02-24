@@ -19,12 +19,13 @@ Herramientas para trabajar subtitulos locales:
 - `ffmpeg` y `ffprobe` en PATH (para extraccion).
 - Recomendado: MKVToolNix (`mkvmerge`/`mkvextract`) para escaneo/extraccion/mux mas rapido y robusto en MKV.
 - Opcional: `rich` para barras de progreso mas claras.
+- Opcional: `psutil` para monitoreo de recursos mas preciso (CPU/RAM).
 
 ## Instalacion rapida
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install rich
+python -m pip install rich psutil
 ```
 
 Verificar Ollama:
@@ -59,8 +60,11 @@ Opciones utiles:
 - `--parallel-files N`: cantidad de archivos en paralelo en `--batch` o multi-seleccion (usa subprocesos).
 - `--num-threads N`: hilos para Ollama (`6` por defecto).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
-- En `--batch` y multi-seleccion ahora se imprime progreso global de archivos: `ok/skipped/failed/remaining`.
-- En modo paralelo (`--parallel-files > 1`) se muestra barra de progreso por archivos completados.
+- En ejecuciones multiarchivo se muestra un panel dinamico persistente con:
+  - progreso global/archivo/etapa,
+  - actividad reciente,
+  - tabla de recursos en vivo (CPU/RAM/GPU, cuando el sistema lo permite).
+- El resumen final multiarchivo ahora es compacto (una sola tabla agregada + lista de fallidos si aplica).
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad (predeterminado: on).
@@ -79,6 +83,7 @@ El flujo de traduccion fue optimizado para reducir llamadas extra al modelo y me
 - Presupuesto de reintentos en modo rapido (`--fast`) para priorizar velocidad.
 - Ajuste adaptativo nativo del tamano de lote cuando detecta splits/fallos altos, para estabilizar tiempos sin flags extra.
 - Resumen de metricas por archivo tambien en modo paralelo (`--parallel-files > 1`).
+- Monitor de recursos integrado durante ejecucion (sin flags extra).
 
 En el resumen final veras, entre otros:
 
