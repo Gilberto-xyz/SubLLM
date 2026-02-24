@@ -280,6 +280,7 @@ def print_multi_file_final_summary(
     ok: int,
     failed: int,
     file_results: List[dict],
+    wall_elapsed: float | None = None,
 ) -> None:
     processed = len(file_results)
     ok_results = [row for row in file_results if int(row.get("code", 1)) == 0]
@@ -293,20 +294,32 @@ def print_multi_file_final_summary(
     if cache_lookups_sum > 0:
         cache_rate_text = f"{(cache_hits_sum / float(cache_lookups_sum)) * 100.0:.1f}%"
 
+    metrics = [
+        ("Seleccionados", str(selected_total), None),
+        ("A procesar", str(to_process), None),
+        ("Procesados", str(processed), None),
+        ("OK", str(ok), None),
+        ("Omitidos", str(skipped), None),
+        ("Fallidos", str(failed), None),
+        ("Bloques traducidos", str(translated_blocks_sum), None),
+        ("Tiempo traduciendo", f"{translate_elapsed_sum:.1f}s", format_duration_compact(translate_elapsed_sum)),
+    ]
+    if wall_elapsed is not None:
+        metrics.append(("Tiempo real de pared", f"{wall_elapsed:.1f}s", format_duration_compact(wall_elapsed)))
+        metrics.append(
+            (
+                "Tiempo total acumulado",
+                f"{total_elapsed_sum:.1f}s",
+                f"{format_duration_compact(total_elapsed_sum)} (suma de procesos)",
+            )
+        )
+    else:
+        metrics.append(("Tiempo total acumulado", f"{total_elapsed_sum:.1f}s", format_duration_compact(total_elapsed_sum)))
+    metrics.append(("Cache hit global", cache_rate_text, f"aciertos={cache_hits_sum}, no_en_cache={cache_misses_sum}"))
+
     show_metrics_cards(
         console,
-        [
-            ("Seleccionados", str(selected_total), None),
-            ("A procesar", str(to_process), None),
-            ("Procesados", str(processed), None),
-            ("OK", str(ok), None),
-            ("Omitidos", str(skipped), None),
-            ("Fallidos", str(failed), None),
-            ("Bloques traducidos", str(translated_blocks_sum), None),
-            ("Tiempo traduciendo", f"{translate_elapsed_sum:.1f}s", format_duration_compact(translate_elapsed_sum)),
-            ("Tiempo total acumulado", f"{total_elapsed_sum:.1f}s", format_duration_compact(total_elapsed_sum)),
-            ("Cache hit global", cache_rate_text, f"aciertos={cache_hits_sum}, no_en_cache={cache_misses_sum}"),
-        ],
+        metrics,
         title=title,
         columns=3,
     )
@@ -4511,7 +4524,7 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     console.print("  2) Completo")
     scope_choice = prompt_choice(console, "Alcance", 2, 2)
     limit = 10 if scope_choice == 1 else None
-    skip_summary = scope_choice == 1
+    skip_summary = scope_choice == 1 or bool(args.skip_summary)
     show_execution_roadmap(
         console,
         include_summary=(not skip_summary),
@@ -4528,7 +4541,10 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
         cprint(console, f"Archivos seleccionados: {len(in_paths)}", "bold cyan")
         cprint(console, "Se generara un archivo de salida por cada entrada.", "bold cyan")
     if skip_summary:
-        cprint(console, "Modo muestra: se omite resumen para mayor velocidad.", "yellow")
+        if scope_choice == 1:
+            cprint(console, "Modo muestra: se omite resumen para mayor velocidad.", "yellow")
+        else:
+            cprint(console, "Perfil por defecto: resumen desactivado para mayor velocidad.", "yellow")
     return in_paths, out_path, target_lang, limit, skip_summary, model
 
 
@@ -5042,7 +5058,20 @@ def main() -> int:
     parser.add_argument("--num-threads", type=int, default=6, help="Hilos para ejecucion del modelo")
     parser.add_argument("--num-gpu", type=int, help="Capas GPU para ejecucion del modelo")
     parser.add_argument("--limit", type=int, help="Traduce solo los primeros N bloques de dialogo")
-    parser.add_argument("--skip-summary", action="store_true", help="Omite el paso de resumen")
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
+        "--skip-summary",
+        dest="skip_summary",
+        action="store_true",
+        default=True,
+        help="Omite el paso de resumen (predeterminado: on)",
+    )
+    summary_group.add_argument(
+        "--with-summary",
+        dest="skip_summary",
+        action="store_false",
+        help="Activa resumen/contexto (mas lento, puede mejorar consistencia)",
+    )
     parser.add_argument("--interactive", action="store_true", help="Modo interactivo")
     parser.add_argument("--batch", action="store_true", help="Traduce todos los subtitulos de SUBS_BULK")
     parser.add_argument(
@@ -5178,6 +5207,7 @@ def main() -> int:
             multi_file=True,
         )
 
+        started_wall = time.perf_counter()
         ok, failed, file_results = run_multi_file_jobs(
             client,
             console,
@@ -5186,6 +5216,7 @@ def main() -> int:
             selected_total=selected_total,
             skipped=skipped,
         )
+        wall_elapsed = time.perf_counter() - started_wall
 
         print_multi_file_final_summary(
             console,
@@ -5196,6 +5227,7 @@ def main() -> int:
             ok=ok,
             failed=failed,
             file_results=file_results,
+            wall_elapsed=wall_elapsed,
         )
         return 0 if failed == 0 else 1
 
@@ -5236,6 +5268,7 @@ def main() -> int:
             multi_file=True,
         )
 
+        started_wall = time.perf_counter()
         ok, failed, file_results = run_multi_file_jobs(
             client,
             console,
@@ -5244,6 +5277,7 @@ def main() -> int:
             selected_total=selected_total,
             skipped=skipped,
         )
+        wall_elapsed = time.perf_counter() - started_wall
 
         print_multi_file_final_summary(
             console,
@@ -5254,6 +5288,7 @@ def main() -> int:
             ok=ok,
             failed=failed,
             file_results=file_results,
+            wall_elapsed=wall_elapsed,
         )
         return 0 if failed == 0 else 1
 

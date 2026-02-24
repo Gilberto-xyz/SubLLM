@@ -63,7 +63,8 @@ Opciones utiles:
 - En modo paralelo (`--parallel-files > 1`) se muestra barra de progreso por archivos completados.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
-- `--skip-summary`: omite resumen/contexto para mayor velocidad.
+- `--skip-summary`: omite resumen/contexto para mayor velocidad (predeterminado: on).
+- `--with-summary`: activa resumen/contexto (mas lento, puede mejorar consistencia).
 - `--limit N`: traduce solo los primeros N bloques.
 - `--fast`: aplica perfil rapido (prioriza velocidad sobre cobertura).
 - `--one-shot`: intenta traducir en un lote grande cuando el contexto lo permite.
@@ -91,7 +92,8 @@ En el resumen final veras, entre otros:
 
 Si Ollama usa una sola GPU con memoria limitada:
 
-- Usa modo normal por defecto para mejor cobertura de traduccion.
+- El modo por defecto ya omite resumen para priorizar velocidad.
+- Usa `--with-summary` si quieres reforzar consistencia con contexto global.
 - Activa `--fast --one-shot` solo cuando necesites maxima velocidad.
 - `--parallel-files` usa `3` por defecto.
 - Si notas contencion en otros modelos/equipos, prueba `--parallel-files 2`.
