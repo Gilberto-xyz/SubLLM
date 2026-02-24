@@ -11,6 +11,7 @@ import argparse
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 import fnmatch
 import json
 import math
@@ -46,6 +47,7 @@ except ImportError:
 ASS_TAG_RE = re.compile(r"(\{[^}]*\}|\\N|\\n|\\h)")
 ASS_STRIP_RE = re.compile(r"\{[^}]*\}")
 ASS_VECTOR_TAG_RE = re.compile(r"\\p([1-9]\d*)")
+ASS_KARAOKE_TAG_RE = re.compile(r"\\k[fo]?\d+", flags=re.IGNORECASE)
 ASS_DRAWING_LINE_RE = re.compile(r"^[mlbspnc\d\s\.,+\-]+$", flags=re.IGNORECASE)
 ASS_WORD_RE = re.compile(r"[A-Za-z']+")
 PLACEHOLDER_TOKEN_RE = re.compile(r"__TAG_\d+__")
@@ -72,7 +74,7 @@ SUMMARY_MARKERS = (
     "a lo largo de",
 )
 EN_STOPWORDS = {
-    "the", "and", "you", "your", "for", "with", "that", "this", "was", "are",
+    "the", "and", "i", "you", "your", "for", "with", "that", "this", "was", "are",
     "but", "not", "from", "they", "she", "him", "her", "have", "has", "had",
     "what", "who", "where", "when", "why", "how", "can", "could", "would",
     "should", "will", "just", "about", "into", "like", "there", "them", "then",
@@ -93,6 +95,8 @@ DEFAULT_CTX_TOKENS = 4096
 DEFAULT_PREDICT_TOKENS = 256
 PROMPT_OVERHEAD_TOKENS = 640   # margen conservador para instrucciones/contexto/JSON
 DEFAULT_OUT_FRACTION = 0.60    # si num_predict no viene definido, reservar ~60% ctx para output
+DEFAULT_IN_OUT_RATIO = 1.15    # salida esperada ~= 1.15x entrada (traduccion subtitulos)
+DEFAULT_OUT_FALLBACK_TOKENS = 192
 TRANSLATION_SUMMARY_MAX = 320
 TRANSLATION_TONE_MAX = 180
 ROLLING_CONTEXT_MAX_CHARS = 600
@@ -120,11 +124,13 @@ AUTO_JSON_ATTEMPTS = 0
 AUTO_JSON_FAILS = 0
 BATCH_TRANSLATION_CACHE_MAX = 200000
 BATCH_TRANSLATION_CACHE = OrderedDict()
+RUNTIME_DEFAULT_CTX_TOKENS = DEFAULT_CTX_TOKENS
 EN_SIGNAL_TOKENS = {
     "thanks", "sorry", "please", "yes", "no", "hello", "hi", "bye", "goodbye", "good", "bad",
     "okay", "ok", "yeah", "yep", "nope", "love", "hate", "help", "wait", "stop", "go", "come",
     "look", "listen", "right", "left", "damn", "shit", "fuck", "mom", "dad", "bro", "sis",
 }
+EN_AMBIGUOUS_SIGNAL_TOKENS = {"no", "ok", "okay", "right", "left", "go", "come", "wait", "stop"}
 
 
 class SimpleConsole:
@@ -485,6 +491,31 @@ def set_runtime_flags(format_mode: str, minify_json: bool, bench: bool) -> None:
     AUTO_JSON_FAILS = 0
 
 
+def set_runtime_default_ctx_tokens(num_ctx: int | None) -> None:
+    global RUNTIME_DEFAULT_CTX_TOKENS
+    if num_ctx is None:
+        RUNTIME_DEFAULT_CTX_TOKENS = DEFAULT_CTX_TOKENS
+        return
+    try:
+        parsed = int(num_ctx)
+    except (TypeError, ValueError):
+        return
+    if parsed >= 1024:
+        RUNTIME_DEFAULT_CTX_TOKENS = parsed
+
+
+def effective_num_ctx(options) -> int:
+    opts = options or {}
+    raw = opts.get("num_ctx")
+    if raw is None:
+        return int(RUNTIME_DEFAULT_CTX_TOKENS)
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return int(RUNTIME_DEFAULT_CTX_TOKENS)
+    return max(1024, parsed)
+
+
 def resolve_format_mode(mode: str | None = None) -> str:
     selected = (mode or FORMAT_MODE or "auto").strip().lower()
     if selected not in {"auto", "json", "schema"}:
@@ -675,6 +706,49 @@ class OllamaClient:
         self.model = model
         self.timeout = timeout
         self.keep_alive = keep_alive
+        self._detected_num_ctx: int | None = None
+
+    def detect_model_num_ctx(self) -> int | None:
+        if self._detected_num_ctx is not None:
+            return self._detected_num_ctx
+        payload = {"model": self.model}
+        url = f"{self.host}/api/show"
+        data = dump_json(payload, minify=True).encode("utf-8")
+        req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with request.urlopen(req, timeout=min(10, self.timeout)) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body)
+        except Exception:
+            return None
+
+        candidates: List[int] = []
+        model_info = parsed.get("model_info")
+        if isinstance(model_info, dict):
+            for key, value in model_info.items():
+                if "context_length" not in str(key):
+                    continue
+                try:
+                    parsed_val = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed_val >= 1024:
+                    candidates.append(parsed_val)
+
+        parameters = parsed.get("parameters")
+        if isinstance(parameters, str):
+            for match in re.finditer(r"(?:^|\n)\s*num_ctx\s+(\d+)", parameters):
+                try:
+                    parsed_val = int(match.group(1))
+                except (TypeError, ValueError):
+                    continue
+                if parsed_val >= 1024:
+                    candidates.append(parsed_val)
+
+        if not candidates:
+            return None
+        self._detected_num_ctx = max(candidates)
+        return self._detected_num_ctx
 
     def chat(self, messages, options=None, format=None) -> str:
         payload = {
@@ -1074,6 +1148,31 @@ def ascii_word_tokens(text: str) -> List[str]:
     return [t.lower() for t in re.findall(r"[A-Za-z']+", text)]
 
 
+def english_signal_score(text: str) -> int:
+    tokens = ascii_word_tokens(text)
+    if not tokens:
+        return 0
+    stop_hits = sum(1 for token in tokens if token in EN_STOPWORDS)
+    honor_hits = sum(1 for token in tokens if token in HONORIFICS)
+    contraction_hits = sum(1 for token in tokens if "'" in token)
+    strong_signal_hits = sum(
+        1
+        for token in tokens
+        if token in EN_SIGNAL_TOKENS and token not in EN_AMBIGUOUS_SIGNAL_TOKENS
+    )
+    weak_signal_hits = sum(1 for token in tokens if token in EN_SIGNAL_TOKENS)
+    score = (
+        stop_hits * 2
+        + honor_hits * 2
+        + contraction_hits * 2
+        + strong_signal_hits * 2
+        + weak_signal_hits
+    )
+    if SPANISH_MARKER_RE.search(text or ""):
+        score -= 2
+    return max(0, score)
+
+
 def normalize_target_lang(target_lang: str) -> str:
     lowered = target_lang.strip().lower()
     if lowered in {"spanish", "es", "es-419", "es_419", "espanol"} or lowered.startswith("spanish"):
@@ -1111,11 +1210,15 @@ def has_target_language_leak(source: str, translated: str, target_lang: str) -> 
     has_spanish_markers = bool(SPANISH_MARKER_RE.search(translated))
     has_spanish_signal = has_spanish_markers or es_hits >= 2
     has_english_signal = en_hits >= 2 or "i" in dst_tokens
+    src_en_score = english_signal_score(source)
 
     if mode == "es":
         # A standalone "I" in Spanish output is a strong incomplete-translation signal.
-        if "i" in dst_tokens:
+        if "i" in dst_tokens and src_en_score >= 3:
             return True
+        if src_en_score < 3:
+            # For non-English source lines (romaji, names, effects), avoid expensive false positives.
+            return en_hits >= 4 and not has_spanish_signal and len(dst_tokens) >= 4
         if en_hits >= 2 and not has_spanish_signal:
             return True
         return False
@@ -1139,16 +1242,7 @@ def is_unchanged_english(source_plain: str, translated_plain: str, target_lang: 
         return False
     if src.lower() != dst.lower():
         return False
-    tokens = ascii_word_tokens(src)
-    if not tokens:
-        return False
-    if any(token in EN_STOPWORDS for token in tokens):
-        return True
-    if any(token in HONORIFICS for token in tokens):
-        return True
-    if any(token in EN_SIGNAL_TOKENS for token in tokens):
-        return True
-    return False
+    return english_signal_score(src) >= 2
 
 
 def apply_phrase_overrides(text: str) -> str:
@@ -1564,6 +1658,35 @@ def needs_llm_repair_for_reasons(status: dict, repair_reasons: set[str]) -> bool
     return any(reason in repair_reasons for reason in reasons)
 
 
+def effective_repair_reasons_for_item(
+    item: dict,
+    base_reasons: set[str],
+    target_lang: str,
+) -> set[str]:
+    reasons = set(base_reasons)
+    if normalize_target_lang(target_lang) != "es":
+        return reasons
+    source = str(
+        item.get("original_text_field")
+        or item.get("text_field")
+        or item.get("protected_text")
+        or ""
+    )
+    item_kind = str(item.get("kind") or "")
+    source_plain = ass_plain_text(source) if item_kind.startswith("ass") else source
+    if english_signal_score(source_plain) < 2:
+        reasons.discard("language_leak")
+        reasons.discard("very_suspicious")
+        reasons.discard("unchanged")
+    return reasons
+
+
+def item_needs_llm_repair(item: dict, base_reasons: set[str], target_lang: str) -> bool:
+    status = item.get("status", {})
+    reasons = effective_repair_reasons_for_item(item, base_reasons, target_lang)
+    return needs_llm_repair_for_reasons(status, reasons)
+
+
 def fast_repair_budget(batch_len: int) -> int:
     return max(2, int(math.ceil(FAST_REPAIR_RATIO * max(1, batch_len))))
 
@@ -1595,6 +1718,44 @@ def should_translate(segment: str) -> bool:
 
 def normalize_inline_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").replace("\n", " ").strip())
+
+
+def is_summary_echo(candidate: str, summary: str) -> bool:
+    cand = normalize_inline_text(candidate).lower()
+    summ = normalize_inline_text(summary).lower()
+    if not cand or not summ:
+        return False
+    if cand == summ:
+        return True
+
+    if len(cand) >= 80 and len(summ) >= 80:
+        prefix_len = min(96, len(cand), len(summ))
+        if prefix_len >= 48 and cand[:prefix_len] == summ[:prefix_len]:
+            return True
+
+    if len(cand) >= 64 and len(summ) >= 64:
+        shorter = min(len(cand), len(summ))
+        longer = max(len(cand), len(summ))
+        if shorter / float(longer) >= 0.85 and (cand in summ or summ in cand):
+            return True
+
+    if len(cand) >= 48 and len(summ) >= 48:
+        if SequenceMatcher(None, cand, summ).ratio() >= 0.72:
+            return True
+
+    cand_tokens = [token for token in ascii_word_tokens(cand) if len(token) >= 4]
+    summ_tokens = [token for token in ascii_word_tokens(summ) if len(token) >= 4]
+    if len(cand_tokens) >= 6 and len(summ_tokens) >= 8:
+        cand_set = set(cand_tokens)
+        summ_set = set(summ_tokens)
+        shared = cand_set.intersection(summ_set)
+        if len(shared) >= 6:
+            cand_cov = len(shared) / float(max(1, len(cand_set)))
+            summ_cov = len(shared) / float(max(1, len(summ_set)))
+            if cand_cov >= 0.65 and summ_cov >= 0.35:
+                return True
+
+    return False
 
 
 def is_ass_drawing_payload(text_field: str, plain_text: str) -> bool:
@@ -1631,6 +1792,30 @@ def looks_like_low_value_ass_fragment(plain_text: str) -> bool:
     return False
 
 
+def is_karaoke_syllable_payload(text_field: str) -> bool:
+    if not text_field or not ASS_KARAOKE_TAG_RE.search(text_field):
+        return False
+    tokens = split_ass_text(text_field)
+    text_parts: List[str] = []
+    for token in tokens:
+        if not token or token.startswith("{") or token in {"\\N", "\\n", "\\h"}:
+            continue
+        cleaned = token.strip()
+        if cleaned:
+            text_parts.append(cleaned)
+    if len(text_parts) < 4:
+        return False
+    alpha_parts = [part for part in text_parts if ASS_WORD_RE.search(part)]
+    if len(alpha_parts) < 4:
+        return False
+    compact_lengths = [len(re.sub(r"\s+", "", part)) for part in alpha_parts]
+    if not compact_lengths:
+        return False
+    if max(compact_lengths) <= 3 and (sum(1 for n in compact_lengths if n <= 2) / float(len(compact_lengths))) >= 0.7:
+        return True
+    return False
+
+
 def should_translate_ass_dialogue(text_field: str, effect: str = "", for_summary: bool = False) -> bool:
     plain = ass_plain_text(text_field)
     normalized = normalize_inline_text(plain)
@@ -1639,6 +1824,8 @@ def should_translate_ass_dialogue(text_field: str, effect: str = "", for_summary
     if not should_translate(normalized):
         return False
     if is_ass_drawing_payload(text_field, normalized):
+        return False
+    if is_karaoke_syllable_payload(text_field):
         return False
     words = ASS_WORD_RE.findall(normalized.lower())
     effect_norm = (effect or "").strip().lower()
@@ -1726,13 +1913,20 @@ def reduce_adaptive_batch_cap(current_cap: int) -> int:
 
 def translation_budget(options) -> Tuple[int, int]:
     opts = options or {}
-    num_ctx = int(opts.get("num_ctx") or DEFAULT_CTX_TOKENS)
+    num_ctx = effective_num_ctx(opts)
     num_predict = int(opts.get("num_predict") or 0)
-    # Reserva de salida coherente con cómo luego calculas num_predict dinámico.
-    reserve_out = num_predict if num_predict > 0 else int(math.floor(num_ctx * DEFAULT_OUT_FRACTION))
-    reserve_out = max(256, min(4096, reserve_out))
-    # Presupuesto de entrada real: ctx - reserva_out - overhead fijo.
-    budget = max(256, num_ctx - reserve_out - PROMPT_OVERHEAD_TOKENS)
+
+    if num_predict > 0:
+        reserve_out = max(128, min(4096, num_predict))
+        budget = max(256, num_ctx - reserve_out - PROMPT_OVERHEAD_TOKENS)
+        return budget, reserve_out
+
+    # Presupuesto conservador basado en ratio entrada/salida típico de traducción.
+    usable = max(512, num_ctx - PROMPT_OVERHEAD_TOKENS)
+    est_budget = int(math.floor((usable - DEFAULT_OUT_FALLBACK_TOKENS) / (1.0 + DEFAULT_IN_OUT_RATIO)))
+    max_budget = max(256, usable - DEFAULT_OUT_FALLBACK_TOKENS)
+    budget = max(256, min(max_budget, est_budget))
+    reserve_out = max(DEFAULT_OUT_FALLBACK_TOKENS, usable - budget)
     return budget, reserve_out
 
 
@@ -1840,7 +2034,7 @@ def parse_array_of_arrays_response(content: str, expected_len: int) -> List[List
 
 def build_options_for_batch(options, texts: List[str], force_temperature_zero: bool = False) -> dict:
     options_batch = dict(options or {})
-    num_ctx = int(options_batch.get("num_ctx") or DEFAULT_CTX_TOKENS)
+    num_ctx = effective_num_ctx(options_batch)
     in_tokens = sum(estimate_tokens_from_text(text) for text in texts)
     est_out = int(math.ceil(in_tokens * 1.2)) + 64
     base_predict = int(options_batch.get("num_predict") or 0)
@@ -1872,10 +2066,10 @@ def build_adaptive_batches(
 ) -> List[List[dict]]:
     if not items:
         return []
-    budget, reserve_out = translation_budget(options)
+    budget, _reserve_out = translation_budget(options)
     cap = len(items) if batch_size is None or int(batch_size) <= 0 else max(1, int(batch_size))
     est_total = sum(item.get("in_tokens", estimate_tokens_from_text(item.get("protected_text", ""))) for item in items)
-    if est_total + reserve_out <= budget and len(items) <= cap:
+    if est_total <= budget and len(items) <= cap:
         return [items]
 
     if one_shot:
@@ -1885,7 +2079,7 @@ def build_adaptive_batches(
                 f"--one-shot solicitado pero batch-size={cap} < items={len(items)}; usando lotes adaptativos.",
                 "yellow",
             )
-        elif est_total + reserve_out <= budget:
+        elif est_total <= budget:
             return [items]
         else:
             cprint(
@@ -2115,12 +2309,15 @@ def translate_json_batch_with_split(
 
     if out is not None:
         cleaned_out = [strip_label_prefix(item) for item in out]
-        if len(cleaned_out) == len(texts):
-            return cleaned_out
-        if allow_partial:
-            if len(cleaned_out) > len(texts):
-                return cleaned_out[: len(texts)]
-            return cleaned_out + [None] * (len(texts) - len(cleaned_out))
+        if summary and cleaned_out and is_summary_echo(cleaned_out[0], summary):
+            RUNTIME_METRICS.bump("translate.summary_echo_rejected")
+        else:
+            if len(cleaned_out) == len(texts):
+                return cleaned_out
+            if allow_partial:
+                if len(cleaned_out) > len(texts):
+                    return cleaned_out[: len(texts)]
+                return cleaned_out + [None] * (len(texts) - len(cleaned_out))
     if len(texts) == 1:
         return [None]
     if max_split_depth is not None and depth >= max_split_depth:
@@ -2249,6 +2446,14 @@ def evaluate_ass_line_candidate(state: dict, cleaned: str, target_lang: str) -> 
         reasons.append("language_leak")
     if is_very_suspicious_translation(source_plain, restored_plain):
         reasons.append("very_suspicious")
+    src_words = count_words(source_plain)
+    dst_words = count_words(restored_plain)
+    if src_words <= 3 and dst_words >= max(8, src_words * 4):
+        reasons.append("short_line_overflow")
+    elif src_words <= 3:
+        sentence_marks = restored_plain.count(".") + restored_plain.count("?") + restored_plain.count("!")
+        if sentence_marks >= 2 and dst_words >= 5:
+            reasons.append("short_line_overflow")
     return {
         "candidate": cleaned,
         "restored": restored,
@@ -2270,7 +2475,7 @@ def scan_ass_line_candidate(state: dict, candidate: str, target_lang: str) -> di
 
     ok = len(reasons) == 0
     needs_llm_repair = any(
-        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious", "short_line_overflow"}
         for reason in reasons
     )
     return {
@@ -2300,10 +2505,18 @@ def scan_ass_segment_candidate(source_token: str, candidate: str, target_lang: s
         reasons.append("unchanged")
     if is_very_suspicious_translation(source_token, cleaned):
         reasons.append("very_suspicious")
+    src_words = count_words(source_token)
+    dst_words = count_words(cleaned)
+    if src_words <= 3 and dst_words >= max(8, src_words * 4):
+        reasons.append("short_line_overflow")
+    elif src_words <= 3:
+        sentence_marks = cleaned.count(".") + cleaned.count("?") + cleaned.count("!")
+        if sentence_marks >= 2 and dst_words >= 5:
+            reasons.append("short_line_overflow")
 
     ok = len(reasons) == 0
     needs_llm_repair = any(
-        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
+        reason in {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious", "short_line_overflow"}
         for reason in reasons
     )
     return {
@@ -2369,6 +2582,12 @@ def self_test_ass_repair_snippet() -> None:
 
 def self_test_hybrid_pipeline() -> None:
     assert strip_label_prefix("ASS: Hola") == "Hola"
+    summary = "The group is trapped in a desperate situation and plans a chaotic strategy."
+    assert is_summary_echo(summary, summary)
+    assert is_summary_echo(summary + " ", summary)
+    paraphrase = "A group is trapped in a desperate situation and tries a chaotic strategy."
+    assert is_summary_echo(paraphrase, summary)
+    assert not is_summary_echo("I am fine.", summary)
     src = "{\\i1}do{\\i0}\\Nnow"
     protected, replacements = ass_protect_tags(src)
     candidate = "__TAG_0__hacer__TAG_1____TAG_2__ahora"
@@ -2388,6 +2607,14 @@ def self_test_hybrid_pipeline() -> None:
     assert not should_skip_srt_block_translation("Whatever.")
     assert not should_translate_ass_dialogue(r"{\an5\p1}m 0 -6 l -4.5 -1.5 l -4.5 3 l 0 7.5", effect="fx")
     assert not should_translate_ass_dialogue(r"{\an5\pos(766.5,64.5)}da", effect="fx", for_summary=True)
+    karaoke_line = (
+        r"{\r\t(0,1230,\c&H704215&\kf123)}da{\r\t(1230,1280,\c&H704215&\kf5)}s"
+        r"{\r\t(1280,1470,\c&H704215&\kf19)}so{\r\t(1470,1610,\c&H704215&\kf14)}u "
+        r"{\r\t(1610,1730,\c&H704215&\kf12)}da{\r\t(1730,1790,\c&H704215&\kf6)}s"
+        r"{\r\t(1790,2070,\c&H704215&\kf28)}so{\r\t(2070,2350,\c&H704215&\kf28)}u"
+    )
+    assert is_karaoke_syllable_payload(karaoke_line)
+    assert not should_translate_ass_dialogue(karaoke_line, effect="fx")
     assert should_translate_ass_dialogue(
         "Word on the street is that policy changed right when the Council Chairman did.",
         effect="",
@@ -2481,6 +2708,20 @@ def self_test_hybrid_pipeline() -> None:
     miss_status = scan_ass_line_candidate(miss_state, "Miss Ito,", "Spanish")
     assert "unchanged" in miss_status["reasons"]
     assert miss_status["needs_llm_repair"]
+    overflow_src = "dassou dassou"
+    overflow_protected, overflow_repl = ass_protect_tags(overflow_src)
+    overflow_state = {
+        "text_field": overflow_src,
+        "protected": overflow_protected,
+        "replacements": overflow_repl,
+    }
+    overflow_ass_status = scan_ass_line_candidate(
+        overflow_state,
+        "Un grupo de personas se encuentra en una situacion desesperada, amenazados con la expulsion.",
+        "Spanish",
+    )
+    assert "short_line_overflow" in overflow_ass_status["reasons"]
+    assert overflow_ass_status["needs_llm_repair"]
     credits = "{\\an8}Brought to you by [ToonsHub]"
     assert apply_phrase_overrides(credits) == "{\\an8}Tra\u00eddo por [el_inmortus]"
 
@@ -3146,7 +3387,7 @@ def translate_srt(
                 failed_items = [
                     item
                     for item in work_batch
-                    if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                    if item_needs_llm_repair(item, repair_reasons, target_lang)
                 ]
                 split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
                 severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
@@ -3196,7 +3437,7 @@ def translate_srt(
                     failed_items = [
                         item
                         for item in work_batch
-                        if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                        if item_needs_llm_repair(item, repair_reasons, target_lang)
                     ]
                     if fast_mode and failed_items:
                         failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
@@ -3221,7 +3462,7 @@ def translate_srt(
                 for item in work_batch:
                     if "forced_text" in item:
                         final_text = item["forced_text"]
-                    elif item["status"]["ok"] or not needs_llm_repair_for_reasons(item["status"], repair_reasons):
+                    elif item["status"]["ok"] or not item_needs_llm_repair(item, repair_reasons, target_lang):
                         final_text = enforce_line_count(
                             item["status"]["candidate"],
                             item["expected_line_count"],
@@ -3344,9 +3585,9 @@ def translate_ass(
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(deduped_items, ass_batch_cap, options, one_shot, console)
     repair_reasons = (
-        {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged"}
+        {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "short_line_overflow"}
         if fast_mode
-        else {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious"}
+        else {"empty_output", "placeholder_mismatch", "placeholder_artifacts", "unexpected_ass_markup", "unchanged", "language_leak", "very_suspicious", "short_line_overflow"}
     )
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     active_batch_cap = ass_batch_cap
@@ -3405,7 +3646,7 @@ def translate_ass(
                 failed_items = [
                     item
                     for item in work_batch
-                    if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                    if item_needs_llm_repair(item, repair_reasons, target_lang)
                 ]
                 split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
                 severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
@@ -3458,7 +3699,7 @@ def translate_ass(
                         failed_items = [
                             item
                             for item in work_batch
-                            if needs_llm_repair_for_reasons(item["status"], repair_reasons)
+                            if item_needs_llm_repair(item, repair_reasons, target_lang)
                         ]
                         if fast_mode and failed_items:
                             failed_items = trim_failed_items_for_fast_budget(failed_items, fast_repair_budget(len(work_batch)))
@@ -3483,7 +3724,7 @@ def translate_ass(
                             final_text = forced
                         else:
                             final_text = item["original_text_field"]
-                    elif status["ok"] or not needs_llm_repair_for_reasons(status, repair_reasons):
+                    elif status["ok"] or not item_needs_llm_repair(item, repair_reasons, target_lang):
                         final_text = status["restored"]
                     else:
                         if fast_mode:
@@ -3542,7 +3783,7 @@ def translate_ass(
                 clone_status = scan_ass_line_candidate(clone, leader_candidate, target_lang)
                 clone["candidate"] = clone_status["candidate"]
                 clone["status"] = clone_status
-                if clone_status["ok"] or not needs_llm_repair_for_reasons(clone_status, repair_reasons):
+                if clone_status["ok"] or not item_needs_llm_repair(clone, repair_reasons, target_lang):
                     clone["final_text"] = clone_status["restored"]
                 else:
                     clone["final_text"] = clone["original_text_field"]
@@ -4696,6 +4937,15 @@ def main() -> int:
         )
 
     client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
+    if args.num_ctx is not None:
+        set_runtime_default_ctx_tokens(args.num_ctx)
+    else:
+        detected_ctx = client.detect_model_num_ctx()
+        if detected_ctx is not None:
+            set_runtime_default_ctx_tokens(detected_ctx)
+            cprint(console, f"Contexto del modelo detectado automaticamente: num_ctx={detected_ctx}", "cyan")
+        else:
+            set_runtime_default_ctx_tokens(DEFAULT_CTX_TOKENS)
 
     if args.batch:
         files = collect_batch_inputs(args.in_path, args.target)
