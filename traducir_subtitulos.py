@@ -255,6 +255,119 @@ def show_metrics_cards(
         console.print(Columns(cards[idx : idx + chunk], expand=True, equal=True))
 
 
+def format_duration_compact(seconds: float) -> str:
+    safe = max(0.0, float(seconds or 0.0))
+    rounded = int(round(safe))
+    hours, rem = divmod(rounded, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{safe:.1f}s"
+
+
+def print_multi_file_final_summary(
+    console,
+    *,
+    title: str,
+    selected_total: int,
+    to_process: int,
+    skipped: int,
+    ok: int,
+    failed: int,
+    file_results: List[dict],
+) -> None:
+    processed = len(file_results)
+    ok_results = [row for row in file_results if int(row.get("code", 1)) == 0]
+    total_elapsed_sum = sum(float(row.get("total_elapsed", 0.0) or 0.0) for row in ok_results)
+    translate_elapsed_sum = sum(float(row.get("translate_elapsed", 0.0) or 0.0) for row in ok_results)
+    translated_blocks_sum = sum(int(row.get("translated_blocks", 0) or 0) for row in ok_results)
+    cache_hits_sum = sum(int(row.get("cache_hits", 0) or 0) for row in ok_results)
+    cache_misses_sum = sum(int(row.get("cache_misses", 0) or 0) for row in ok_results)
+    cache_lookups_sum = cache_hits_sum + cache_misses_sum
+    cache_rate_text = "-"
+    if cache_lookups_sum > 0:
+        cache_rate_text = f"{(cache_hits_sum / float(cache_lookups_sum)) * 100.0:.1f}%"
+
+    show_metrics_cards(
+        console,
+        [
+            ("Seleccionados", str(selected_total), None),
+            ("A procesar", str(to_process), None),
+            ("Procesados", str(processed), None),
+            ("OK", str(ok), None),
+            ("Omitidos", str(skipped), None),
+            ("Fallidos", str(failed), None),
+            ("Bloques traducidos", str(translated_blocks_sum), None),
+            ("Tiempo traduciendo", f"{translate_elapsed_sum:.1f}s", format_duration_compact(translate_elapsed_sum)),
+            ("Tiempo total acumulado", f"{total_elapsed_sum:.1f}s", format_duration_compact(total_elapsed_sum)),
+            ("Cache hit global", cache_rate_text, f"aciertos={cache_hits_sum}, no_en_cache={cache_misses_sum}"),
+        ],
+        title=title,
+        columns=3,
+    )
+
+    if not file_results:
+        return
+
+    if not RICH_AVAILABLE:
+        console.print("Detalle por archivo:")
+        for row in file_results:
+            file_name = row.get("file_name", "?")
+            status = "OK" if int(row.get("code", 1)) == 0 else f"ERROR({row.get('code', 1)})"
+            blocks = row.get("translated_blocks")
+            blocks_text = str(blocks) if blocks is not None else "-"
+            tr_sec = row.get("translate_elapsed")
+            tr_text = f"{float(tr_sec):.1f}s" if isinstance(tr_sec, (int, float)) and tr_sec > 0 else "-"
+            tot_sec = row.get("total_elapsed")
+            tot_text = f"{float(tot_sec):.1f}s" if isinstance(tot_sec, (int, float)) and tot_sec > 0 else "-"
+            cache_hits = int(row.get("cache_hits", 0) or 0)
+            cache_misses = int(row.get("cache_misses", 0) or 0)
+            lookups = cache_hits + cache_misses
+            if lookups > 0:
+                cache_text = f"{cache_hits}/{lookups} ({(cache_hits / float(lookups)) * 100.0:.1f}%)"
+            else:
+                cache_text = "-"
+            console.print(
+                f"- {file_name} | estado={status} | bloques={blocks_text} | trad={tr_text} | total={tot_text} | cache={cache_text}"
+            )
+        return
+
+    table = Table(
+        title="Detalle por archivo",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold cyan",
+        show_lines=False,
+        expand=True,
+    )
+    table.add_column("Archivo", overflow="fold")
+    table.add_column("Estado", justify="center", no_wrap=True)
+    table.add_column("Bloques", justify="right", no_wrap=True)
+    table.add_column("Trad.", justify="right", no_wrap=True)
+    table.add_column("Total", justify="right", no_wrap=True)
+    table.add_column("Cache", justify="right", no_wrap=True)
+    for row in file_results:
+        file_name = row.get("file_name", "?")
+        code = int(row.get("code", 1))
+        status = "[bold green]OK[/bold green]" if code == 0 else f"[bold red]ERROR({code})[/bold red]"
+        blocks = row.get("translated_blocks")
+        blocks_text = str(blocks) if blocks is not None else "-"
+        tr_sec = row.get("translate_elapsed")
+        tr_text = f"{float(tr_sec):.1f}s" if isinstance(tr_sec, (int, float)) and tr_sec > 0 else "-"
+        tot_sec = row.get("total_elapsed")
+        tot_text = f"{float(tot_sec):.1f}s" if isinstance(tot_sec, (int, float)) and tot_sec > 0 else "-"
+        cache_hits = int(row.get("cache_hits", 0) or 0)
+        cache_misses = int(row.get("cache_misses", 0) or 0)
+        lookups = cache_hits + cache_misses
+        if lookups > 0:
+            cache_text = f"{cache_hits}/{lookups} ({(cache_hits / float(lookups)) * 100.0:.1f}%)"
+        else:
+            cache_text = "-"
+        table.add_row(file_name, status, blocks_text, tr_text, tot_text, cache_text)
+    console.print(table)
+
+
 def show_execution_roadmap(
     console,
     *,
@@ -630,7 +743,11 @@ def print_runtime_breakdown(console, total_elapsed: float) -> None:
         hit_rate = (cache_hits / float(cache_lookups)) * 100.0
         cprint(
             console,
-            f"Cache de traduccion: aciertos={cache_hits}, fallos={cache_misses}, escrituras={cache_writes}, tasa_acierto={hit_rate:.1f}%",
+            (
+                "Cache de traduccion: "
+                f"consultas={cache_lookups}, aciertos={cache_hits}, no_en_cache={cache_misses}, "
+                f"escrituras={cache_writes}, tasa_acierto={hit_rate:.1f}%"
+            ),
             "cyan",
         )
     schema_retries = RUNTIME_METRICS.counters.get("format.schema_retry.attempts", 0)
@@ -4578,7 +4695,7 @@ def translate_many_files_parallel_subprocess(
     jobs: List[Tuple[Path, Path]],
     selected_total: int,
     skipped: int = 0,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, List[dict]]:
     max_workers = max(1, int(args.parallel_files or 1))
     total = len(jobs)
     cprint(
@@ -4589,6 +4706,7 @@ def translate_many_files_parallel_subprocess(
     ok = 0
     failed = 0
     done = 0
+    file_results: List[dict] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
             pool.submit(run_subprocess_translation, build_single_file_subprocess_cmd(args, in_path, out_path)): (in_path, out_path)
@@ -4601,6 +4719,20 @@ def translate_many_files_parallel_subprocess(
                 code, elapsed, output = future.result()
             except Exception as exc:
                 failed += 1
+                file_results.append(
+                    {
+                        "file_path": in_path,
+                        "file_name": in_path.name,
+                        "out_path": None,
+                        "code": -1,
+                        "translated_blocks": None,
+                        "translate_elapsed": None,
+                        "total_elapsed": 0.0,
+                        "cache_hits": 0,
+                        "cache_misses": 0,
+                        "cache_writes": 0,
+                    }
+                )
                 cprint(console, f"[{done}/{total}] ERROR {in_path.name}: {exc}", "bold red")
                 print_global_file_progress(
                     console,
@@ -4614,6 +4746,20 @@ def translate_many_files_parallel_subprocess(
             if code == 0:
                 ok += 1
                 summary = extract_translation_summary(output)
+                file_results.append(
+                    {
+                        "file_path": in_path,
+                        "file_name": in_path.name,
+                        "out_path": None,
+                        "code": 0,
+                        "translated_blocks": None,
+                        "translate_elapsed": None,
+                        "total_elapsed": float(elapsed),
+                        "cache_hits": 0,
+                        "cache_misses": 0,
+                        "cache_writes": 0,
+                    }
+                )
                 cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
                 if summary:
                     console.print(summary)
@@ -4627,6 +4773,20 @@ def translate_many_files_parallel_subprocess(
                 )
                 continue
             failed += 1
+            file_results.append(
+                {
+                    "file_path": in_path,
+                    "file_name": in_path.name,
+                    "out_path": None,
+                    "code": int(code),
+                    "translated_blocks": None,
+                    "translate_elapsed": None,
+                    "total_elapsed": float(elapsed),
+                    "cache_hits": 0,
+                    "cache_misses": 0,
+                    "cache_writes": 0,
+                }
+            )
             cprint(console, f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
             if output.strip():
                 tail = "\n".join(output.splitlines()[-30:])
@@ -4639,7 +4799,7 @@ def translate_many_files_parallel_subprocess(
                 skipped,
                 failed,
             )
-    return ok, failed
+    return ok, failed, file_results
 
 
 def translate_single_file(
@@ -4649,12 +4809,24 @@ def translate_single_file(
     in_path: Path,
     out_path: Path,
     progress_tracker: GlobalProgressTracker | None = None,
-) -> int:
+) -> Tuple[int, dict]:
     RUNTIME_METRICS.reset()
     text, line_ending, final_newline, bom = read_text(in_path)
     ext = in_path.suffix.lower()
     options = build_ollama_options(args)
     start_total = time.perf_counter()
+    file_stats: dict = {
+        "file_path": in_path,
+        "file_name": in_path.name,
+        "out_path": out_path,
+        "code": 1,
+        "translated_blocks": 0,
+        "translate_elapsed": 0.0,
+        "total_elapsed": 0.0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_writes": 0,
+    }
 
     summary = ""
     tone_guide = ""
@@ -4677,7 +4849,9 @@ def translate_single_file(
                 plain_lines = collect_plain_lines_srt(text)
             else:
                 print("Tipo de archivo no soportado. Usa .ass o .srt", file=sys.stderr)
-                return 2
+                file_stats["code"] = 2
+                file_stats["total_elapsed"] = time.perf_counter() - start_total
+                return 2, file_stats
             summary = summarize_subs(
                 client,
                 plain_lines,
@@ -4738,7 +4912,9 @@ def translate_single_file(
             )
         else:
             print("Tipo de archivo no soportado. Usa .ass o .srt", file=sys.stderr)
-            return 2
+            file_stats["code"] = 2
+            file_stats["total_elapsed"] = time.perf_counter() - start_total
+            return 2, file_stats
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_text(out_path, out_text.splitlines(), line_ending, final_newline, bom)
@@ -4749,7 +4925,14 @@ def translate_single_file(
     cprint(console, f"Tiempo (traduccion): {translate_elapsed:.1f}s", "bold green")
     cprint(console, f"Tiempo (total): {total_elapsed:.1f}s", "bold green")
     print_runtime_breakdown(console, total_elapsed)
-    return 0
+    file_stats["code"] = 0
+    file_stats["translated_blocks"] = int(translated_count)
+    file_stats["translate_elapsed"] = float(translate_elapsed)
+    file_stats["total_elapsed"] = float(total_elapsed)
+    file_stats["cache_hits"] = int(RUNTIME_METRICS.counters.get("translate.cache.hits", 0))
+    file_stats["cache_misses"] = int(RUNTIME_METRICS.counters.get("translate.cache.misses", 0))
+    file_stats["cache_writes"] = int(RUNTIME_METRICS.counters.get("translate.cache.writes", 0))
+    return 0, file_stats
 
 
 def run_multi_file_jobs(
@@ -4759,9 +4942,10 @@ def run_multi_file_jobs(
     jobs: List[Tuple[Path, Path]],
     selected_total: int,
     skipped: int,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, List[dict]]:
     ok = 0
     failed = 0
+    file_results: List[dict] = []
     if args.parallel_files > 1 and len(jobs) > 1:
         if selected_total > 1:
             print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
@@ -4785,7 +4969,7 @@ def run_multi_file_jobs(
                     selected_total,
                     include_summary=(not args.skip_summary),
                 )
-                code = translate_single_file(
+                code, stats = translate_single_file(
                     client,
                     console,
                     args,
@@ -4793,12 +4977,13 @@ def run_multi_file_jobs(
                     out_file,
                     progress_tracker=tracker,
                 )
+                file_results.append(stats)
                 if code == 0:
                     ok += 1
                 else:
                     failed += 1
                 tracker.set_counts(ok, skipped, failed)
-        return ok, failed
+        return ok, failed, file_results
 
     if selected_total > 1:
         print_global_file_progress(console, skipped, selected_total, ok, skipped, failed)
@@ -4808,7 +4993,8 @@ def run_multi_file_jobs(
             cprint(console, f"\n=== Traduciendo [{next_global}/{selected_total}]: {file_path.name} ===", "bold cyan")
         else:
             cprint(console, f"\n=== Traduciendo: {file_path.name} ===", "bold cyan")
-        code = translate_single_file(client, console, args, file_path, out_file)
+        code, stats = translate_single_file(client, console, args, file_path, out_file)
+        file_results.append(stats)
         if code == 0:
             ok += 1
         else:
@@ -4822,7 +5008,7 @@ def run_multi_file_jobs(
                 skipped,
                 failed,
             )
-    return ok, failed
+    return ok, failed, file_results
 
 
 def main() -> int:
@@ -4980,7 +5166,7 @@ def main() -> int:
             multi_file=True,
         )
 
-        ok, failed = run_multi_file_jobs(
+        ok, failed, file_results = run_multi_file_jobs(
             client,
             console,
             args,
@@ -4989,10 +5175,15 @@ def main() -> int:
             skipped=skipped,
         )
 
-        cprint(
+        print_multi_file_final_summary(
             console,
-            f"\nResumen de lote -> ok: {ok}, omitidos: {skipped}, fallidos: {failed}",
-            "bold cyan" if failed == 0 else "bold yellow",
+            title="Resumen final del lote",
+            selected_total=selected_total,
+            to_process=len(jobs),
+            skipped=skipped,
+            ok=ok,
+            failed=failed,
+            file_results=file_results,
         )
         return 0 if failed == 0 else 1
 
@@ -5033,7 +5224,7 @@ def main() -> int:
             multi_file=True,
         )
 
-        ok, failed = run_multi_file_jobs(
+        ok, failed, file_results = run_multi_file_jobs(
             client,
             console,
             args,
@@ -5042,10 +5233,15 @@ def main() -> int:
             skipped=skipped,
         )
 
-        cprint(
+        print_multi_file_final_summary(
             console,
-            f"\nResumen multiarchivo -> ok: {ok}, omitidos: {skipped}, fallidos: {failed}",
-            "bold cyan" if failed == 0 else "bold yellow",
+            title="Resumen final multiarchivo",
+            selected_total=selected_total,
+            to_process=len(jobs),
+            skipped=skipped,
+            ok=ok,
+            failed=failed,
+            file_results=file_results,
         )
         return 0 if failed == 0 else 1
 
@@ -5067,7 +5263,8 @@ def main() -> int:
         include_summary=(not args.skip_summary),
         multi_file=False,
     )
-    return translate_single_file(client, console, args, in_path, out_path)
+    code, _stats = translate_single_file(client, console, args, in_path, out_path)
+    return code
 
 
 if __name__ == "__main__":
