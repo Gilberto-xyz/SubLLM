@@ -60,12 +60,12 @@ Opciones utiles:
 - `--num-threads N`: hilos para Ollama (`6` por defecto).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
 - En `--batch` y multi-seleccion ahora se imprime progreso global de archivos: `ok/skipped/failed/remaining`.
+- En modo paralelo (`--parallel-files > 1`) se muestra barra de progreso por archivos completados.
 - `--batch-size`: tamano de lote para traduccion.
 - `--ass-mode line|segment`: modo de traduccion en archivos ASS.
 - `--skip-summary`: omite resumen/contexto para mayor velocidad.
 - `--limit N`: traduce solo los primeros N bloques.
-- `--fast`: aplica perfil rapido (ahora activo por defecto).
-- `--no-fast`: desactiva el perfil rapido por defecto.
+- `--fast`: aplica perfil rapido (prioriza velocidad sobre cobertura).
 - `--one-shot`: intenta traducir en un lote grande cuando el contexto lo permite.
 - `--bench`: imprime metricas detalladas de rendimiento por llamada.
 
@@ -91,14 +91,15 @@ En el resumen final veras, entre otros:
 
 Si Ollama usa una sola GPU con memoria limitada:
 
-- El perfil rapido (`--fast`) ya viene activo por defecto y habilita `one-shot`.
-- `--parallel-files` ahora usa `3` por defecto.
+- Usa modo normal por defecto para mejor cobertura de traduccion.
+- Activa `--fast --one-shot` solo cuando necesites maxima velocidad.
+- `--parallel-files` usa `3` por defecto.
 - Si notas contencion en otros modelos/equipos, prueba `--parallel-files 2`.
 
 Ejemplo de lote recomendado:
 
 ```bash
-python traducir_subtitulos.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish
+python traducir_subtitulos.py --batch --in "*S01E0[345]*fre_sub2.ass" --target Spanish --fast --one-shot
 ```
 
 Salida por defecto:

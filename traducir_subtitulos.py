@@ -151,6 +151,9 @@ class DummyProgress:
     def advance(self, task_id: int, advance: int = 1):
         return None
 
+    def update(self, task_id: int, **kwargs):
+        return None
+
 
 def get_console():
     if RICH_AVAILABLE:
@@ -4714,98 +4717,100 @@ def translate_many_files_parallel_subprocess(
     failed = 0
     done = 0
     file_results: List[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(run_subprocess_translation, build_single_file_subprocess_cmd(args, in_path, out_path)): (in_path, out_path)
-            for in_path, out_path in jobs
-        }
-        for future in as_completed(future_map):
-            done += 1
-            in_path, _ = future_map[future]
-            try:
-                code, elapsed, output = future.result()
-            except Exception as exc:
-                failed += 1
-                file_results.append(
-                    {
-                        "file_path": in_path,
-                        "file_name": in_path.name,
-                        "out_path": None,
-                        "code": -1,
-                        "translated_blocks": None,
-                        "translate_elapsed": None,
-                        "total_elapsed": 0.0,
-                        "cache_hits": 0,
-                        "cache_misses": 0,
-                        "cache_writes": 0,
-                    }
-                )
-                cprint(console, f"[{done}/{total}] ERROR {in_path.name}: {exc}", "bold red")
-                print_global_file_progress(
-                    console,
-                    skipped + done,
-                    selected_total,
-                    ok,
-                    skipped,
-                    failed,
-                )
-                continue
-            if code == 0:
-                ok += 1
-                summary = extract_translation_summary(output)
-                file_results.append(
-                    {
-                        "file_path": in_path,
-                        "file_name": in_path.name,
-                        "out_path": None,
-                        "code": 0,
-                        "translated_blocks": None,
-                        "translate_elapsed": None,
-                        "total_elapsed": float(elapsed),
-                        "cache_hits": 0,
-                        "cache_misses": 0,
-                        "cache_writes": 0,
-                    }
-                )
-                cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
-                if summary:
-                    console.print(summary)
-                print_global_file_progress(
-                    console,
-                    skipped + done,
-                    selected_total,
-                    ok,
-                    skipped,
-                    failed,
-                )
-                continue
-            failed += 1
-            file_results.append(
-                {
-                    "file_path": in_path,
-                    "file_name": in_path.name,
-                    "out_path": None,
-                    "code": int(code),
-                    "translated_blocks": None,
-                    "translate_elapsed": None,
-                    "total_elapsed": float(elapsed),
-                    "cache_hits": 0,
-                    "cache_misses": 0,
-                    "cache_writes": 0,
-                }
+    progress_ctx = progress_bar(console) if RICH_AVAILABLE else DummyProgress()
+    with progress_ctx as progress:
+        progress_task_id = None
+        if RICH_AVAILABLE:
+            progress_task_id = progress.add_task(
+                f"Archivos | ok={ok}, omitidos={skipped}, fallidos={failed}",
+                total=max(1, selected_total),
+                completed=min(selected_total, skipped),
             )
-            cprint(console, f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
-            if output.strip():
-                tail = "\n".join(output.splitlines()[-30:])
-                console.print(tail)
-            print_global_file_progress(
-                console,
-                skipped + done,
-                selected_total,
-                ok,
-                skipped,
-                failed,
-            )
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(run_subprocess_translation, build_single_file_subprocess_cmd(args, in_path, out_path)): (in_path, out_path)
+                for in_path, out_path in jobs
+            }
+            for future in as_completed(future_map):
+                done += 1
+                in_path, _ = future_map[future]
+                try:
+                    code, elapsed, output = future.result()
+                except Exception as exc:
+                    failed += 1
+                    file_results.append(
+                        {
+                            "file_path": in_path,
+                            "file_name": in_path.name,
+                            "out_path": None,
+                            "code": -1,
+                            "translated_blocks": None,
+                            "translate_elapsed": None,
+                            "total_elapsed": 0.0,
+                            "cache_hits": 0,
+                            "cache_misses": 0,
+                            "cache_writes": 0,
+                        }
+                    )
+                    cprint(console, f"[{done}/{total}] ERROR {in_path.name}: {exc}", "bold red")
+                else:
+                    if code == 0:
+                        ok += 1
+                        summary = extract_translation_summary(output)
+                        file_results.append(
+                            {
+                                "file_path": in_path,
+                                "file_name": in_path.name,
+                                "out_path": None,
+                                "code": 0,
+                                "translated_blocks": None,
+                                "translate_elapsed": None,
+                                "total_elapsed": float(elapsed),
+                                "cache_hits": 0,
+                                "cache_misses": 0,
+                                "cache_writes": 0,
+                            }
+                        )
+                        cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
+                        if summary:
+                            console.print(summary)
+                    else:
+                        failed += 1
+                        file_results.append(
+                            {
+                                "file_path": in_path,
+                                "file_name": in_path.name,
+                                "out_path": None,
+                                "code": int(code),
+                                "translated_blocks": None,
+                                "translate_elapsed": None,
+                                "total_elapsed": float(elapsed),
+                                "cache_hits": 0,
+                                "cache_misses": 0,
+                                "cache_writes": 0,
+                            }
+                        )
+                        cprint(console, f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)", "bold red")
+                        if output.strip():
+                            tail = "\n".join(output.splitlines()[-30:])
+                            console.print(tail)
+
+                current_done = min(selected_total, skipped + done)
+                if RICH_AVAILABLE and progress_task_id is not None:
+                    progress.update(
+                        progress_task_id,
+                        description=f"Archivos | ok={ok}, omitidos={skipped}, fallidos={failed}",
+                        completed=current_done,
+                    )
+                else:
+                    print_global_file_progress(
+                        console,
+                        current_done,
+                        selected_total,
+                        ok,
+                        skipped,
+                        failed,
+                    )
     return ok, failed, file_results
 
 
@@ -5048,20 +5053,7 @@ def main() -> int:
     )
     parser.add_argument("--overwrite", action="store_true", help="Sobrescribe salidas en modo --batch")
     parser.add_argument("--ass-mode", choices=["line", "segment"], default="line", help="Modo de traduccion ASS")
-    fast_group = parser.add_mutually_exclusive_group()
-    fast_group.add_argument(
-        "--fast",
-        dest="fast",
-        action="store_true",
-        default=True,
-        help="Aplica valores predeterminados de perfil rapido (predeterminado: on)",
-    )
-    fast_group.add_argument(
-        "--no-fast",
-        dest="fast",
-        action="store_false",
-        help="Desactiva el perfil rapido predeterminado",
-    )
+    parser.add_argument("--fast", action="store_true", help="Aplica valores predeterminados de perfil rapido")
     parser.add_argument("--one-shot", action="store_true", help="Fuerza un solo lote cuando entra en contexto")
     parser.add_argument("--rolling-context", type=int, default=0, help="Usa las ultimas N lineas traducidas como contexto")
     parser.add_argument(
