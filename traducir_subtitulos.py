@@ -178,6 +178,7 @@ class ResourceMonitor:
             "source": "none",
             "sys_cpu_pct": None,
             "sys_ram_used_gb": None,
+            "sys_ram_total_gb": None,
             "ollama_cpu_pct": None,
             "ollama_ram_gb": None,
             "ollama_pids": 0,
@@ -251,6 +252,7 @@ class ResourceMonitor:
         now = time.perf_counter()
         vm = psutil.virtual_memory()
         sys_ram_used = (float(vm.total) - float(vm.available)) / BYTES_PER_GB
+        sys_ram_total = float(vm.total) / BYTES_PER_GB
         sys_cpu = float(psutil.cpu_percent(interval=None))
 
         ollama_procs = []
@@ -297,6 +299,7 @@ class ResourceMonitor:
             "source": "psutil",
             "sys_cpu_pct": sys_cpu,
             "sys_ram_used_gb": sys_ram_used,
+            "sys_ram_total_gb": sys_ram_total,
             "ollama_cpu_pct": ollama_cpu_pct,
             "ollama_ram_gb": ollama_ram_gb,
             "ollama_pids": len(pids),
@@ -309,7 +312,7 @@ class ResourceMonitor:
     def _collect_with_windows_tools(self) -> dict | None:
         now = time.perf_counter()
         sys_cpu = self._windows_system_cpu_pct()
-        sys_ram_used = self._windows_memory_used_gb()
+        sys_ram_used, sys_ram_total = self._windows_memory_stats_gb()
         rows = self._poll_windows_tasklist_snapshot()
         current_cpu: dict[int, float] = {}
         ollama_ram_gb = 0.0
@@ -341,6 +344,7 @@ class ResourceMonitor:
             "source": "windows-native",
             "sys_cpu_pct": sys_cpu,
             "sys_ram_used_gb": sys_ram_used,
+            "sys_ram_total_gb": sys_ram_total,
             "ollama_cpu_pct": ollama_cpu_pct,
             "ollama_ram_gb": ollama_ram_gb,
             "ollama_pids": len(current_cpu),
@@ -413,13 +417,13 @@ class ResourceMonitor:
             return 0
         return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
-    def _windows_memory_used_gb(self) -> float | None:
+    def _windows_memory_stats_gb(self) -> Tuple[float | None, float | None]:
         if os.name != "nt":
-            return None
+            return None, None
         try:
             import ctypes
         except Exception:
-            return None
+            return None, None
 
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [
@@ -437,9 +441,10 @@ class ResourceMonitor:
         status = MEMORYSTATUSEX()
         status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
         if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return None
+            return None, None
         used = float(status.ullTotalPhys - status.ullAvailPhys) / BYTES_PER_GB
-        return max(0.0, used)
+        total = float(status.ullTotalPhys) / BYTES_PER_GB
+        return max(0.0, used), max(0.0, total)
 
     def _windows_system_cpu_pct(self) -> float | None:
         if os.name != "nt":
@@ -496,6 +501,7 @@ class ResourceMonitor:
             "source": "basic",
             "sys_cpu_pct": None,
             "sys_ram_used_gb": None,
+            "sys_ram_total_gb": None,
             "ollama_cpu_pct": None,
             "ollama_ram_gb": None,
             "ollama_pids": 0,
@@ -975,41 +981,71 @@ class GlobalProgressTracker:
         return f"{float(value):.1f}%"
 
     @staticmethod
-    def _fmt_gb(value: float | None) -> str:
-        if value is None:
-            return "-"
-        return f"{float(value):.2f} GB"
+    def _pct_from_ratio(used: float | None, total: float | None) -> float | None:
+        if used is None or total is None or total <= 0:
+            return None
+        pct = (float(used) / float(total)) * 100.0
+        return max(0.0, min(100.0, pct))
+
+    @staticmethod
+    def _stress_style(pct: float | None) -> Tuple[str, str]:
+        if pct is None:
+            return "N", "dim"
+        p = max(0.0, min(100.0, float(pct)))
+        if p < 45.0:
+            return "L", "green"
+        if p < 70.0:
+            return "M", "yellow"
+        if p < 85.0:
+            return "H", "bold bright_yellow"
+        return "C", "bold red"
+
+    def _ascii_meter(self, pct: float | None, width: int = 8) -> str:
+        if pct is None:
+            return "[dim]-------- N[/dim]"
+        p = max(0.0, min(100.0, float(pct)))
+        size = max(6, int(width))
+        fill = int(round((p / 100.0) * size))
+        fill = max(0, min(size, fill))
+        bar = ("#" * fill) + ("-" * (size - fill))
+        code, style = self._stress_style(p)
+        return f"[{style}]{bar} {code}[/{style}]"
 
     def _render_resource_panel(self):
         snapshot = self._resource_monitor.latest()
+        sys_cpu_pct = self._safe_float(snapshot.get("sys_cpu_pct"))
+        sys_ram_used_gb = self._safe_float(snapshot.get("sys_ram_used_gb"))
+        sys_ram_total_gb = self._safe_float(snapshot.get("sys_ram_total_gb"))
+        sys_ram_pct = self._pct_from_ratio(sys_ram_used_gb, sys_ram_total_gb)
+
+        ollama_cpu_pct = self._safe_float(snapshot.get("ollama_cpu_pct"))
+        ollama_ram_gb = self._safe_float(snapshot.get("ollama_ram_gb"))
+        ollama_ram_pct = self._pct_from_ratio(ollama_ram_gb, sys_ram_total_gb)
+
+        gpu_util_pct = self._safe_float(snapshot.get("gpu_util_pct"))
+        gpu_mem_used = self._safe_float(snapshot.get("gpu_mem_used_gb"))
+        gpu_mem_total = self._safe_float(snapshot.get("gpu_mem_total_gb"))
+        gpu_mem_pct = self._pct_from_ratio(gpu_mem_used, gpu_mem_total)
+
         table = Table(
             show_header=False,
             box=box.SIMPLE_HEAVY,
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Metrica", style="bold cyan")
-        table.add_column("Valor", justify="right", style="white")
+        table.add_column("Metrica", style="bold cyan", no_wrap=True)
+        table.add_column("Carga", style="white", no_wrap=True)
         table.add_row("Fuente", str(snapshot.get("source", "-")))
-        table.add_row("CPU sistema", self._fmt_pct(self._safe_float(snapshot.get("sys_cpu_pct"))))
-        table.add_row("RAM sistema", self._fmt_gb(self._safe_float(snapshot.get("sys_ram_used_gb"))))
-        table.add_row("CPU ollama", self._fmt_pct(self._safe_float(snapshot.get("ollama_cpu_pct"))))
-        table.add_row("RAM ollama", self._fmt_gb(self._safe_float(snapshot.get("ollama_ram_gb"))))
-        table.add_row("PIDs ollama", str(int(snapshot.get("ollama_pids", 0) or 0)))
-        gpu_util = self._safe_float(snapshot.get("gpu_util_pct"))
-        gpu_mem_used = self._safe_float(snapshot.get("gpu_mem_used_gb"))
-        gpu_mem_total = self._safe_float(snapshot.get("gpu_mem_total_gb"))
-        gpu_mem = "-"
-        if gpu_mem_used is not None:
-            if gpu_mem_total is not None and gpu_mem_total > 0:
-                gpu_mem = f"{gpu_mem_used:.2f}/{gpu_mem_total:.2f} GB"
-            else:
-                gpu_mem = f"{gpu_mem_used:.2f} GB"
-        table.add_row("GPU util", self._fmt_pct(gpu_util))
-        table.add_row("GPU memoria", gpu_mem)
+        table.add_row("CPU sys", f"{self._fmt_pct(sys_cpu_pct)} {self._ascii_meter(sys_cpu_pct)}")
+        table.add_row("RAM sys", f"{self._fmt_pct(sys_ram_pct)} {self._ascii_meter(sys_ram_pct)}")
+        table.add_row("CPU oll", f"{self._fmt_pct(ollama_cpu_pct)} {self._ascii_meter(ollama_cpu_pct)}")
+        table.add_row("RAM oll", f"{self._fmt_pct(ollama_ram_pct)} {self._ascii_meter(ollama_ram_pct)}")
+        table.add_row("GPU util", f"{self._fmt_pct(gpu_util_pct)} {self._ascii_meter(gpu_util_pct)}")
+        table.add_row("GPU mem", f"{self._fmt_pct(gpu_mem_pct)} {self._ascii_meter(gpu_mem_pct)}")
+        table.add_row("PIDs oll", f"{int(snapshot.get('ollama_pids', 0) or 0)} [dim]-------- N[/dim]")
         errors = int(snapshot.get("errors", 0) or 0)
         if errors > 0:
-            table.add_row("Monitor", f"[yellow]fallos={errors}[/yellow]")
+            table.add_row("Monitor", f"[yellow]e={errors} ######## W[/yellow]")
 
         return Panel(
             table,
