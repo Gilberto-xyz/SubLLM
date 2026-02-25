@@ -880,10 +880,13 @@ class GlobalProgressTracker:
         self.skipped = max(0, int(skipped or 0))
         self.failed = 0
         self._enabled = bool(RICH_AVAILABLE)
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._live_lock = threading.Lock()
         self._progress = None
         self._live = None
         self._resource_monitor = ResourceMonitor(interval_seconds=1.0)
+        self._refresh_thread: threading.Thread | None = None
+        self._refresh_stop = threading.Event()
         self._global_task_id = None
         self._file_task_id = None
         self._stage_task_id = None
@@ -908,7 +911,6 @@ class GlobalProgressTracker:
             console=self.console,
             transient=False,
         )
-        self._progress.start()
         initial_done = min(self.total_files, self.skipped)
         self._global_task_id = self._progress.add_task(
             self._global_desc(),
@@ -925,16 +927,25 @@ class GlobalProgressTracker:
             transient=False,
         )
         self._live.start()
+        self._refresh_stop.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="tracker-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
         self.log_event("Panel dinamico activo (progreso + recursos).", "bold cyan")
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self._refresh_stop.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=2.0)
+            self._refresh_thread = None
         self._resource_monitor.stop()
         if self._live is not None:
             self._live.stop()
             self._live = None
-        if self._progress is not None:
-            self._progress.stop()
         return False
 
     def _global_desc(self) -> str:
@@ -946,7 +957,16 @@ class GlobalProgressTracker:
     def _refresh_live(self) -> None:
         if not self._is_ready():
             return
-        self._live.update(self._build_layout(), refresh=True)
+        with self._live_lock:
+            if self._live is None:
+                return
+            self._live.update(self._build_layout(), refresh=True)
+
+    def _refresh_loop(self) -> None:
+        while not self._refresh_stop.wait(1.0):
+            if not self._is_ready():
+                continue
+            self._refresh_live()
 
     @staticmethod
     def _fmt_pct(value: float | None) -> str:
@@ -1001,6 +1021,8 @@ class GlobalProgressTracker:
         )
 
     def _render_events_panel(self):
+        with self._state_lock:
+            events_snapshot = list(self._events[-6:])
         table = Table(
             show_header=True,
             box=box.SIMPLE_HEAVY,
@@ -1009,10 +1031,10 @@ class GlobalProgressTracker:
         )
         table.add_column("Hora", justify="right", no_wrap=True, width=8)
         table.add_column("Evento", overflow="fold")
-        if not self._events:
+        if not events_snapshot:
             table.add_row("-", "[dim]Esperando actividad...[/dim]")
         else:
-            for ts, message, style in self._events[-6:]:
+            for ts, message, style in events_snapshot:
                 table.add_row(ts, f"[{style}]{message}[/{style}]")
         return Panel(
             table,
@@ -5887,6 +5909,8 @@ def main() -> int:
             skipped=skipped,
         )
         wall_elapsed = time.perf_counter() - started_wall
+        if RICH_AVAILABLE:
+            console.print()
 
         print_multi_file_final_summary(
             console,
@@ -5948,6 +5972,8 @@ def main() -> int:
             skipped=skipped,
         )
         wall_elapsed = time.perf_counter() - started_wall
+        if RICH_AVAILABLE:
+            console.print()
 
         print_multi_file_final_summary(
             console,
