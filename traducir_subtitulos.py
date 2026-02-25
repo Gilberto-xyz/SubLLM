@@ -28,7 +28,7 @@ from typing import Any, List, Tuple, TypeVar
 from urllib import request, error
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.columns import Columns
     from rich.live import Live
     from rich.layout import Layout
@@ -137,6 +137,8 @@ AUTO_JSON_FAILS = 0
 BATCH_TRANSLATION_CACHE_MAX = 200000
 BATCH_TRANSLATION_CACHE = OrderedDict()
 RUNTIME_DEFAULT_CTX_TOKENS = DEFAULT_CTX_TOKENS
+STATUS_STREAM_PREFIX = "__SUBLLM_STATUS__"
+STATUS_STREAM_ENABLED = False
 EN_SIGNAL_TOKENS = {
     "thanks", "sorry", "please", "yes", "no", "hello", "hi", "bye", "goodbye", "good", "bad",
     "okay", "ok", "yeah", "yep", "nope", "love", "hate", "help", "wait", "stop", "go", "come",
@@ -598,6 +600,35 @@ def cprint(console, text: str, style: str | None = None) -> None:
         console.print(text)
 
 
+def emit_status_stream(channel: str, message: str, style: str = "dim") -> None:
+    if not STATUS_STREAM_ENABLED:
+        return
+    payload = {
+        "ts": time.strftime("%H:%M:%S"),
+        "channel": str(channel or "core"),
+        "message": str(message or ""),
+        "style": str(style or "dim"),
+    }
+    line = STATUS_STREAM_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    print(line, flush=True)
+
+
+def parse_status_stream_line(raw_line: str) -> dict | None:
+    line = str(raw_line or "").strip()
+    if not line.startswith(STATUS_STREAM_PREFIX):
+        return None
+    payload_text = line[len(STATUS_STREAM_PREFIX) :].strip()
+    if not payload_text:
+        return None
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def subtitle_type_label_and_style(path: Path) -> Tuple[str, str]:
     ext = path.suffix.lower()
     if ext == ".srt":
@@ -915,6 +946,8 @@ class GlobalProgressTracker:
         "tone_guide": "Guia de tono",
         "translate": "Traduccion",
     }
+    _ACTIVE_LOCK = threading.RLock()
+    _ACTIVE_INSTANCE: "GlobalProgressTracker | None" = None
 
     def __init__(self, console, total_files: int, skipped: int = 0) -> None:
         self.console = console
@@ -936,9 +969,24 @@ class GlobalProgressTracker:
         self._stage_total = 1
         self._stage_completed = 0
         self._events: list[Tuple[str, str, str]] = []
+        self._trace_rows: list[Tuple[str, str, str, str]] = []
         self._parallel_workers = 0
         self._parallel_total = 0
         self._parallel_done = 0
+
+    @classmethod
+    def set_active(cls, tracker: "GlobalProgressTracker | None") -> None:
+        with cls._ACTIVE_LOCK:
+            cls._ACTIVE_INSTANCE = tracker
+
+    @classmethod
+    def emit_live_trace(cls, channel: str, message: str, style: str = "dim") -> None:
+        with cls._ACTIVE_LOCK:
+            active = cls._ACTIVE_INSTANCE
+        if active is None:
+            emit_status_stream(channel, message, style)
+            return
+        active.log_trace(channel, message, style)
 
     def __enter__(self):
         if not self._enabled:
@@ -977,10 +1025,15 @@ class GlobalProgressTracker:
             daemon=True,
         )
         self._refresh_thread.start()
+        self.set_active(self)
         self.log_event("Panel dinamico activo (progreso + recursos).", "bold cyan")
+        self.log_trace("sistema", "Canal en tiempo real activo (Ollama + JSON + workers).", "bold cyan")
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        with self._ACTIVE_LOCK:
+            if self.__class__._ACTIVE_INSTANCE is self:
+                self.__class__._ACTIVE_INSTANCE = None
         self._refresh_stop.set()
         if self._refresh_thread is not None:
             self._refresh_thread.join(timeout=2.0)
@@ -1122,21 +1175,56 @@ class GlobalProgressTracker:
             expand=True,
         )
 
+    def _render_trace_panel(self):
+        with self._state_lock:
+            trace_snapshot = list(self._trace_rows[-11:])
+        table = Table(
+            show_header=True,
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+            expand=True,
+        )
+        table.add_column("Hora", justify="right", no_wrap=True, width=8)
+        table.add_column("Canal", style="bold bright_blue", no_wrap=True, width=10)
+        table.add_column("Tiempo real", overflow="fold")
+        rows_count = 0
+        if not trace_snapshot:
+            table.add_row("-", "idle", "[dim]Sin trazas todavia...[/dim]")
+            rows_count = 1
+        else:
+            for ts, channel, message, style in trace_snapshot:
+                table.add_row(ts, channel, f"[{style}]{message}[/{style}]")
+                rows_count += 1
+        filler_rows = max(0, 11 - rows_count)
+        for _ in range(filler_rows):
+            table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]...[/dim]")
+        return Panel(
+            table,
+            title="Tiempo real",
+            border_style="bright_black",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+
+    def _render_progress_panel(self):
+        body = Group(
+            self._progress,
+            self._render_trace_panel(),
+        )
+        return Panel(
+            body,
+            title="Progreso",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+
     def _build_layout(self):
         top = Layout(name="top")
         top.split_row(
-            Layout(
-                Panel(
-                    self._progress,
-                    title="Progreso",
-                    border_style="bright_blue",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                    expand=True,
-                ),
-                ratio=2,
-                name="progress",
-            ),
+            Layout(self._render_progress_panel(), ratio=2, name="progress"),
             Layout(self._render_resource_panel(), ratio=1, name="resources"),
         )
         root = Layout(name="root")
@@ -1155,12 +1243,29 @@ class GlobalProgressTracker:
         except Exception:
             return None
 
+    @staticmethod
+    def _compact_message(text: str, limit: int = 140) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 3)] + "..."
+
     def log_event(self, message: str, style: str = "white") -> None:
         now = time.strftime("%H:%M:%S")
         with self._state_lock:
             self._events.append((now, str(message), style))
             if len(self._events) > 12:
                 self._events = self._events[-12:]
+            self._refresh_live()
+
+    def log_trace(self, channel: str, message: str, style: str = "dim") -> None:
+        now = time.strftime("%H:%M:%S")
+        channel_text = self._compact_message(str(channel or "core"), limit=12)
+        message_text = self._compact_message(str(message or ""), limit=170)
+        with self._state_lock:
+            self._trace_rows.append((now, channel_text, message_text, style))
+            if len(self._trace_rows) > 28:
+                self._trace_rows = self._trace_rows[-28:]
             self._refresh_live()
 
     def start_file(self, file_path: Path, file_index: int, total_files: int, include_summary: bool) -> None:
@@ -1188,6 +1293,7 @@ class GlobalProgressTracker:
         self._parallel_total = 0
         self._parallel_done = 0
         self.log_event(f"Iniciando archivo {file_index}/{total_files}: {file_path.name}", "cyan")
+        self.log_trace("archivo", f"[{file_index}/{total_files}] {file_path.name}", "cyan")
 
     def stage_start(self, stage_key: str, total: int) -> None:
         if not self._is_ready():
@@ -1201,6 +1307,7 @@ class GlobalProgressTracker:
         )
         self._stage_total = max(1, int(total or 1))
         self._stage_completed = 0
+        self.log_trace("etapa", f"{label} (0/{self._stage_total})", "bright_cyan")
         self._refresh_live()
 
     def stage_advance(self, amount: int = 1) -> None:
@@ -1242,6 +1349,11 @@ class GlobalProgressTracker:
             f"Modo paralelo activo: workers={self._parallel_workers}, trabajos={self._parallel_total}.",
             "bold cyan",
         )
+        self.log_trace(
+            "paralelo",
+            f"Subprocesos activos={self._parallel_workers}, trabajos={self._parallel_total}.",
+            "bold cyan",
+        )
 
     def update_parallel_progress(self, done: int) -> None:
         if not self._is_ready():
@@ -1259,6 +1371,12 @@ class GlobalProgressTracker:
             total=self._parallel_total,
             completed=self._parallel_done,
         )
+        if self._parallel_done == 0 or self._parallel_done == self._parallel_total:
+            self.log_trace(
+                "paralelo",
+                f"Completados {self._parallel_done}/{self._parallel_total} archivos.",
+                "cyan",
+            )
         self._refresh_live()
 
     def set_counts(self, ok: int, skipped: int, failed: int) -> None:
@@ -1604,6 +1722,28 @@ class OllamaClient:
             format_name = format
         elif isinstance(format, dict):
             format_name = "schema"
+        option_view = options if isinstance(options, dict) else {}
+        temp_value = option_view.get("temperature")
+        num_ctx_value = option_view.get("num_ctx")
+        num_predict_value = option_view.get("num_predict")
+        user_preview = ""
+        for msg in reversed(messages or []):
+            if str(msg.get("role", "")).lower() != "user":
+                continue
+            user_preview = GlobalProgressTracker._compact_message(str(msg.get("content", "")), limit=118)
+            break
+        GlobalProgressTracker.emit_live_trace(
+            "ollama",
+            (
+                f"REQ fmt={format_name} chars={prompt_chars} bytes={len(data)} "
+                f"temp={temp_value if temp_value is not None else '-'} "
+                f"ctx={num_ctx_value if num_ctx_value is not None else '-'} "
+                f"pred={num_predict_value if num_predict_value is not None else '-'}"
+            ),
+            "cyan",
+        )
+        if user_preview:
+            GlobalProgressTracker.emit_live_trace("request", f"user={user_preview}", "dim")
         started = time.perf_counter()
         attempts = max(1, OLLAMA_RETRY_ATTEMPTS)
         body = ""
@@ -1619,13 +1759,28 @@ class OllamaClient:
                     f"Ollama request timed out after {self.timeout}s "
                     f"(attempt {attempt}/{attempts})"
                 )
+                GlobalProgressTracker.emit_live_trace(
+                    "ollama",
+                    f"Timeout (socket) intento {attempt}/{attempts}.",
+                    "yellow",
+                )
             except TimeoutError as exc:
                 last_exc = OllamaTimeoutError(
                     f"Ollama request timed out after {self.timeout}s "
                     f"(attempt {attempt}/{attempts})"
                 )
+                GlobalProgressTracker.emit_live_trace(
+                    "ollama",
+                    f"Timeout intento {attempt}/{attempts}.",
+                    "yellow",
+                )
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
+                GlobalProgressTracker.emit_live_trace(
+                    "ollama",
+                    f"HTTP {exc.code} en intento {attempt}/{attempts}.",
+                    "bold red",
+                )
                 raise RuntimeError(f"Ollama HTTP {exc.code}: {body}") from exc
             except error.URLError as exc:
                 reason = exc.reason
@@ -1634,12 +1789,27 @@ class OllamaClient:
                         f"Ollama request timed out after {self.timeout}s "
                         f"(attempt {attempt}/{attempts})"
                     )
+                    GlobalProgressTracker.emit_live_trace(
+                        "ollama",
+                        f"Timeout (urlerror) intento {attempt}/{attempts}.",
+                        "yellow",
+                    )
                 elif isinstance(reason, ConnectionRefusedError):
                     last_exc = RuntimeError(
                         f"Cannot reach Ollama at {self.host} "
                         f"(connection refused, attempt {attempt}/{attempts}). Is it running?"
                     )
+                    GlobalProgressTracker.emit_live_trace(
+                        "ollama",
+                        f"Conexion rechazada intento {attempt}/{attempts}.",
+                        "bold red",
+                    )
                 else:
+                    GlobalProgressTracker.emit_live_trace(
+                        "ollama",
+                        f"URLError no controlado: {reason}",
+                        "bold red",
+                    )
                     raise RuntimeError(
                         f"Cannot reach Ollama at {self.host}. Is it running?"
                     ) from exc
@@ -1648,9 +1818,15 @@ class OllamaClient:
                     f"Cannot reach Ollama at {self.host} "
                     f"(connection refused, attempt {attempt}/{attempts}). Is it running?"
                 )
+                GlobalProgressTracker.emit_live_trace(
+                    "ollama",
+                    f"Conexion rechazada intento {attempt}/{attempts}.",
+                    "bold red",
+                )
             if attempt < attempts:
                 time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * attempt)
         if last_exc is not None:
+            GlobalProgressTracker.emit_live_trace("ollama", "Fallo definitivo al consultar Ollama.", "bold red")
             raise last_exc
         elapsed = time.perf_counter() - started
         RUNTIME_METRICS.seconds["ollama.chat"] += elapsed
@@ -1667,10 +1843,23 @@ class OllamaClient:
             payload = json.loads(body)
             content = payload["message"]["content"]
             RUNTIME_METRICS.bump("ollama.response_chars", len(content))
+            preview = GlobalProgressTracker._compact_message(content, limit=118)
+            GlobalProgressTracker.emit_live_trace(
+                "ollama",
+                f"RESP {elapsed:.2f}s chars={len(content)}",
+                "green",
+            )
+            if preview:
+                GlobalProgressTracker.emit_live_trace("response", preview, "dim")
             if BENCH_MODE:
                 print(f"[bench] ollama out_chars={len(content)}")
             return content
         except Exception as exc:
+            GlobalProgressTracker.emit_live_trace(
+                "ollama",
+                f"Respuesta invalida (preview): {GlobalProgressTracker._compact_message(body, limit=118)}",
+                "yellow",
+            )
             raise RuntimeError(f"Unexpected Ollama response: {body[:200]}") from exc
 
 
@@ -3052,6 +3241,15 @@ def translate_json_batch(
     else:
         request_format = "json"
         used_auto_json = selected_format_mode == "auto"
+    request_format_name = "schema" if isinstance(request_format, dict) else str(request_format)
+    GlobalProgressTracker.emit_live_trace(
+        "json",
+        (
+            f"Batch={len(texts)} modo={mode} fmt={selected_format_mode}->{request_format_name} "
+            f"temp={options_batch.get('temperature', '-')} partial={'on' if allow_partial else 'off'}"
+        ),
+        "cyan",
+    )
     already_schema = isinstance(request_format, dict)
     try:
         already_temp0 = float(options_batch.get("temperature", 0.0)) == 0.0
@@ -3061,17 +3259,24 @@ def translate_json_batch(
         content = client.chat(messages, options=options_batch, format=request_format)
     parsed = parse_array_response(content, len(texts))
     if parsed is not None:
+        GlobalProgressTracker.emit_live_trace("json", f"Parse OK {len(parsed)}/{len(texts)} items.", "green")
         if used_auto_json:
             AUTO_JSON_ATTEMPTS += 1
         return parsed
     if allow_partial:
         partial = parse_array_response_loose(content)
         if partial:
+            GlobalProgressTracker.emit_live_trace(
+                "json",
+                f"Parse parcial {len(partial)}/{len(texts)} items.",
+                "yellow",
+            )
             if BENCH_MODE:
                 print(
                     f"[bench] partial_parse accepted size={len(partial)} expected={len(texts)}"
                 )
             return partial
+    GlobalProgressTracker.emit_live_trace("json", f"Parse fallido para {len(texts)} items.", "yellow")
     if used_auto_json:
         AUTO_JSON_ATTEMPTS += 1
         AUTO_JSON_FAILS += 1
@@ -3089,6 +3294,7 @@ def translate_json_batch(
         return None
     # Fast path in auto mode: retry once with strict schema + temp=0 only on parse/length failure.
     RUNTIME_METRICS.bump("format.schema_retry.attempts")
+    GlobalProgressTracker.emit_live_trace("json", "Reintento schema+temp0 por fallo de parseo.", "yellow")
     schema_options = build_options_for_batch(
         options=options,
         texts=texts,
@@ -3096,7 +3302,12 @@ def translate_json_batch(
     )
     with RUNTIME_METRICS.timed(f"{timing_label}.schema_retry"):
         strict_content = client.chat(messages, options=schema_options, format=schema)
-    return parse_array_response(strict_content, len(texts))
+    strict_parsed = parse_array_response(strict_content, len(texts))
+    if strict_parsed is not None:
+        GlobalProgressTracker.emit_live_trace("json", f"Schema retry OK {len(strict_parsed)}/{len(texts)}.", "green")
+    else:
+        GlobalProgressTracker.emit_live_trace("json", f"Schema retry FAIL {len(texts)} items.", "bold yellow")
+    return strict_parsed
 
 
 def translate_json_batch_with_split(
@@ -4162,6 +4373,9 @@ def translate_srt(
     ass_batch_cap = effective_batch_cap(batch_size, one_shot)
     batches = build_adaptive_batches(deduped_items, ass_batch_cap, options, one_shot, console)
     active_batch_cap = ass_batch_cap
+    total_unique = len(deduped_items)
+    done_unique = 0
+    batch_index = 0
     history: List[str] = []
     progress_ctx = DummyProgress() if progress_tracker is not None else progress_bar(console)
     if progress_tracker is not None:
@@ -4171,6 +4385,7 @@ def translate_srt(
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
+                batch_index += 1
                 RUNTIME_METRICS.bump("translate.top_level_batches", 1)
                 RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
                 split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
@@ -4192,6 +4407,16 @@ def translate_srt(
                     uncached_items.append(item)
                     uncached_sources.append(item["protected_text"])
                     RUNTIME_METRICS.bump("translate.cache.misses")
+                cache_hits_batch = len(work_batch) - len(uncached_items)
+                GlobalProgressTracker.emit_live_trace(
+                    "srt",
+                    (
+                        f"Batch {batch_index} size={len(work_batch)} "
+                        f"cache_hit={cache_hits_batch} cache_miss={len(uncached_items)} "
+                        f"cap={active_batch_cap}"
+                    ),
+                    "cyan",
+                )
                 if uncached_sources:
                     context_hint = rolling_context_snippet(history, rolling_context)
                     out = translate_json_batch_with_split(
@@ -4222,6 +4447,12 @@ def translate_srt(
                     for item in work_batch
                     if item_needs_llm_repair(item, repair_reasons, target_lang)
                 ]
+                if failed_items:
+                    GlobalProgressTracker.emit_live_trace(
+                        "srt",
+                        f"Batch {batch_index} marcados para reparacion: {len(failed_items)}/{len(work_batch)}.",
+                        "yellow",
+                    )
                 split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
                 severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
                 if (
@@ -4336,6 +4567,12 @@ def translate_srt(
                         translation_cache_put(cache_key, final_text)
                         RUNTIME_METRICS.bump("translate.cache.writes")
                     history.append(final_text.replace("\n", " ").strip())
+                done_unique += len(work_batch)
+                GlobalProgressTracker.emit_live_trace(
+                    "srt",
+                    f"Avance {done_unique}/{total_unique} ({(done_unique / float(max(1, total_unique))) * 100.0:.0f}%).",
+                    "green",
+                )
                 if progress_tracker is not None:
                     progress_tracker.stage_advance(len(work_batch))
                 else:
@@ -4424,6 +4661,9 @@ def translate_ass(
     )
     max_split_depth = FAST_SPLIT_MAX_DEPTH if fast_mode else None
     active_batch_cap = ass_batch_cap
+    total_unique = len(deduped_items)
+    done_unique = 0
+    batch_index = 0
     history: List[str] = []
 
     progress_ctx = DummyProgress() if progress_tracker is not None else progress_bar(console)
@@ -4434,6 +4674,7 @@ def translate_ass(
         for batch in batches:
             work_batches = batched(batch, active_batch_cap) if len(batch) > active_batch_cap else [batch]
             for work_batch in work_batches:
+                batch_index += 1
                 RUNTIME_METRICS.bump("translate.top_level_batches", 1)
                 RUNTIME_METRICS.bump("translate.top_level_batch_items", len(work_batch))
                 split_before = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
@@ -4450,6 +4691,16 @@ def translate_ass(
                     uncached_items.append(item)
                     uncached_sources.append(item["protected_text"])
                     RUNTIME_METRICS.bump("translate.cache.misses")
+                cache_hits_batch = len(work_batch) - len(uncached_items)
+                GlobalProgressTracker.emit_live_trace(
+                    "ass",
+                    (
+                        f"Batch {batch_index} size={len(work_batch)} "
+                        f"cache_hit={cache_hits_batch} cache_miss={len(uncached_items)} "
+                        f"cap={active_batch_cap}"
+                    ),
+                    "cyan",
+                )
                 if uncached_sources:
                     context_hint = rolling_context_snippet(history, rolling_context)
                     out = translate_json_batch_with_split(
@@ -4481,6 +4732,12 @@ def translate_ass(
                     for item in work_batch
                     if item_needs_llm_repair(item, repair_reasons, target_lang)
                 ]
+                if failed_items:
+                    GlobalProgressTracker.emit_live_trace(
+                        "ass",
+                        f"Batch {batch_index} marcados para reparacion: {len(failed_items)}/{len(work_batch)}.",
+                        "yellow",
+                    )
                 split_after = RUNTIME_METRICS.counters.get("translate.split.recursions", 0)
                 severe_ratio = len(failed_items) / float(max(1, len(work_batch)))
                 if (
@@ -4589,6 +4846,12 @@ def translate_ass(
                             translation_cache_put(cache_key, protected_final)
                             RUNTIME_METRICS.bump("translate.cache.writes")
                     history.append(ass_plain_text(final_text).replace("\n", " ").strip())
+                done_unique += len(work_batch)
+                GlobalProgressTracker.emit_live_trace(
+                    "ass",
+                    f"Avance {done_unique}/{total_unique} ({(done_unique / float(max(1, total_unique))) * 100.0:.0f}%).",
+                    "green",
+                )
                 if progress_tracker is not None:
                     progress_tracker.stage_advance(len(work_batch))
                 else:
@@ -5358,6 +5621,7 @@ def build_single_file_subprocess_cmd(args, in_path: Path, out_path: Path) -> Lis
         "--parallel-files",
         "1",
         "--child-run",
+        "--status-stream",
     ]
     if args.num_predict is not None:
         cmd.extend(["--num-predict", str(args.num_predict)])
@@ -5384,19 +5648,71 @@ def build_single_file_subprocess_cmd(args, in_path: Path, out_path: Path) -> Lis
     return cmd
 
 
-def run_subprocess_translation(cmd: List[str]) -> Tuple[int, float, str]:
+def run_subprocess_translation(
+    cmd: List[str],
+    status_callback=None,
+) -> Tuple[int, float, str]:
     started = time.perf_counter()
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
+        bufsize=1,
     )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    output_lock = threading.Lock()
+
+    def _consume_stream(stream, sink: list[str], stream_name: str) -> None:
+        if stream is None:
+            return
+        try:
+            for raw in iter(stream.readline, ""):
+                line = raw.rstrip("\r\n")
+                payload = parse_status_stream_line(line)
+                if payload is not None:
+                    if status_callback is not None:
+                        try:
+                            status_callback(payload)
+                        except Exception:
+                            pass
+                    continue
+                with output_lock:
+                    sink.append(line)
+                if status_callback is not None and line.strip():
+                    try:
+                        status_callback(
+                            {
+                                "channel": stream_name,
+                                "message": line.strip(),
+                                "style": "dim",
+                            }
+                        )
+                    except Exception:
+                        pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=_consume_stream, args=(proc.stdout, stdout_lines, "stdout"), daemon=True),
+        threading.Thread(target=_consume_stream, args=(proc.stderr, stderr_lines, "stderr"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return_code = proc.wait()
     elapsed = time.perf_counter() - started
-    combined_output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-    return proc.returncode, elapsed, combined_output
+    with output_lock:
+        combined_output = "\n".join(stdout_lines + ([""] + stderr_lines if stderr_lines else []))
+    return return_code, elapsed, combined_output
 
 
 def extract_translation_summary(output: str) -> str:
@@ -5477,6 +5793,14 @@ def translate_many_files_parallel_subprocess(
     skipped: int = 0,
     progress_tracker: GlobalProgressTracker | None = None,
 ) -> Tuple[int, int, List[dict]]:
+    def worker_tag(path: Path) -> str:
+        stem = path.stem
+        episode_match = re.search(r"S\d{1,2}E\d{1,2}", stem, flags=re.IGNORECASE)
+        if episode_match:
+            return episode_match.group(0).upper()
+        compact = re.sub(r"\s+", " ", stem).strip()
+        return compact[:12] if len(compact) > 12 else compact
+
     max_workers = max(1, int(args.parallel_files or 1))
     total = len(jobs)
     if progress_tracker is not None:
@@ -5501,10 +5825,25 @@ def translate_many_files_parallel_subprocess(
                 completed=min(selected_total, skipped),
             )
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {
-                pool.submit(run_subprocess_translation, build_single_file_subprocess_cmd(args, in_path, out_path)): (in_path, out_path)
-                for in_path, out_path in jobs
-            }
+            future_map = {}
+            for in_path, out_path in jobs:
+                cmd = build_single_file_subprocess_cmd(args, in_path, out_path)
+                if progress_tracker is not None:
+                    tag = worker_tag(in_path)
+
+                    def _status_callback(payload, file_tag=tag):
+                        channel = str(payload.get("channel") or "worker")
+                        message = str(payload.get("message") or "")
+                        style = str(payload.get("style") or "dim")
+                        progress_tracker.log_trace(f"w.{channel}", f"[{file_tag}] {message}", style)
+
+                    future = pool.submit(run_subprocess_translation, cmd, _status_callback)
+                else:
+                    future = pool.submit(run_subprocess_translation, cmd)
+                future_map[future] = (in_path, out_path)
+            if progress_tracker is not None:
+                for in_path, _ in jobs:
+                    progress_tracker.log_trace("worker", f"Lanzado worker para {in_path.name}", "dim")
             for future in as_completed(future_map):
                 done += 1
                 in_path, _ = future_map[future]
@@ -5529,6 +5868,7 @@ def translate_many_files_parallel_subprocess(
                     message = f"[{done}/{total}] ERROR {in_path.name}: {exc}"
                     if progress_tracker is not None:
                         progress_tracker.log_event(message, "bold red")
+                        progress_tracker.log_trace("worker", f"Fallo worker {in_path.name}: {exc}", "bold red")
                     else:
                         cprint(console, message, "bold red")
                 else:
@@ -5552,8 +5892,10 @@ def translate_many_files_parallel_subprocess(
                         )
                         if progress_tracker is not None:
                             progress_tracker.log_event(f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
+                            progress_tracker.log_trace("worker", f"OK {in_path.name} en {elapsed:.1f}s", "green")
                             if summary:
                                 progress_tracker.log_event(summary, "dim")
+                                progress_tracker.log_trace("worker", summary, "dim")
                         else:
                             cprint(console, f"[{done}/{total}] OK {in_path.name} ({elapsed:.1f}s)", "green")
                             if summary:
@@ -5577,9 +5919,11 @@ def translate_many_files_parallel_subprocess(
                         message = f"[{done}/{total}] ERROR {in_path.name} (exit={code}, {elapsed:.1f}s)"
                         if progress_tracker is not None:
                             progress_tracker.log_event(message, "bold red")
+                            progress_tracker.log_trace("worker", f"Exit={code} {in_path.name} ({elapsed:.1f}s)", "bold red")
                             if output.strip():
                                 tail = "\n".join(output.splitlines()[-5:])
                                 progress_tracker.log_event(tail, "red")
+                                progress_tracker.log_trace("stderr", tail, "red")
                         else:
                             cprint(console, message, "bold red")
                             if output.strip():
@@ -5833,6 +6177,7 @@ def run_multi_file_jobs(
 
 
 def main() -> int:
+    global STATUS_STREAM_ENABLED
     console = get_console()
     RUNTIME_METRICS.reset()
     parser = argparse.ArgumentParser(description="Traduce subtitulos .ASS/.SRT usando Ollama local.")
@@ -5899,8 +6244,10 @@ def main() -> int:
     )
     parser.add_argument("--bench", action="store_true", help="Activa logs detallados de bench por llamada")
     parser.add_argument("--self-test", action="store_true", help="Ejecuta auto-pruebas internas y sale")
+    parser.add_argument("--status-stream", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    STATUS_STREAM_ENABLED = bool(args.status_stream)
     set_runtime_flags(args.format_mode, args.minify_json, args.bench)
 
     if args.self_test:
