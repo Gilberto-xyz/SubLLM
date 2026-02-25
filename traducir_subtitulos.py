@@ -34,14 +34,14 @@ try:
     from rich.layout import Layout
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text
     from rich import box
     from rich.progress import (
         BarColumn,
         Progress,
+        ProgressColumn,
         SpinnerColumn,
         TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
     )
     RICH_AVAILABLE = True
 except ImportError:
@@ -870,6 +870,30 @@ def show_execution_roadmap(
     )
 
 
+if RICH_AVAILABLE:
+    class SecondsElapsedColumn(ProgressColumn):
+        def render(self, task):
+            elapsed = task.finished_time if task.finished else task.elapsed
+            if elapsed is None:
+                return Text(" 0.0s", style="dim")
+            return Text(f"{float(elapsed):5.1f}s", style="cyan")
+
+
+    class SecondsRemainingColumn(ProgressColumn):
+        def render(self, task):
+            remaining = task.time_remaining
+            if remaining is None:
+                return Text("--.-s", style="dim")
+            return Text(f"{float(max(0.0, remaining)):5.1f}s", style="bright_black")
+else:
+    class SecondsElapsedColumn:  # pragma: no cover - only used with Rich
+        pass
+
+
+    class SecondsRemainingColumn:  # pragma: no cover - only used with Rich
+        pass
+
+
 def progress_bar(console):
     if RICH_AVAILABLE:
         return Progress(
@@ -878,8 +902,8 @@ def progress_bar(console):
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
             TextColumn("{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
+            SecondsElapsedColumn(),
+            SecondsRemainingColumn(),
             console=console,
         )
     return DummyProgress()
@@ -925,8 +949,8 @@ class GlobalProgressTracker:
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
             TextColumn("{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
+            SecondsElapsedColumn(),
+            SecondsRemainingColumn(),
             console=self.console,
             transient=False,
         )
