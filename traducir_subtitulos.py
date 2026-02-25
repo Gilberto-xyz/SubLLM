@@ -1024,6 +1024,10 @@ class GlobalProgressTracker:
         code, style = self._stress_style(p)
         return f"[{style}]{bar} {code}[/{style}]"
 
+    def _format_value_and_stress(self, pct: float | None) -> str:
+        value = self._fmt_pct(pct)
+        return f"{value:>6}  {self._ascii_meter(pct)}"
+
     def _render_resource_panel(self):
         snapshot = self._resource_monitor.latest()
         sys_cpu_pct = self._safe_float(snapshot.get("sys_cpu_pct"))
@@ -1046,19 +1050,19 @@ class GlobalProgressTracker:
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Metrica", style="bold cyan", no_wrap=True)
-        table.add_column("Carga", style="white", no_wrap=True)
+        table.add_column("Metrica", style="bold cyan", no_wrap=True, width=8)
+        table.add_column("Valor / Stress", style="white", no_wrap=True)
         table.add_row("Fuente", str(snapshot.get("source", "-")))
-        table.add_row("CPU sys", f"{self._fmt_pct(sys_cpu_pct)} {self._ascii_meter(sys_cpu_pct)}")
-        table.add_row("RAM sys", f"{self._fmt_pct(sys_ram_pct)} {self._ascii_meter(sys_ram_pct)}")
-        table.add_row("CPU oll", f"{self._fmt_pct(ollama_cpu_pct)} {self._ascii_meter(ollama_cpu_pct)}")
-        table.add_row("RAM oll", f"{self._fmt_pct(ollama_ram_pct)} {self._ascii_meter(ollama_ram_pct)}")
-        table.add_row("GPU util", f"{self._fmt_pct(gpu_util_pct)} {self._ascii_meter(gpu_util_pct)}")
-        table.add_row("GPU mem", f"{self._fmt_pct(gpu_mem_pct)} {self._ascii_meter(gpu_mem_pct)}")
-        table.add_row("PIDs oll", f"{int(snapshot.get('ollama_pids', 0) or 0)} [dim]-------- N[/dim]")
+        table.add_row("CPU sys", self._format_value_and_stress(sys_cpu_pct))
+        table.add_row("RAM sys", self._format_value_and_stress(sys_ram_pct))
+        table.add_row("CPU oll", self._format_value_and_stress(ollama_cpu_pct))
+        table.add_row("RAM oll", self._format_value_and_stress(ollama_ram_pct))
+        table.add_row("GPU util", self._format_value_and_stress(gpu_util_pct))
+        table.add_row("GPU mem", self._format_value_and_stress(gpu_mem_pct))
+        table.add_row("PIDs oll", f"{int(snapshot.get('ollama_pids', 0) or 0):>6}  [dim]-------- N[/dim]")
         errors = int(snapshot.get("errors", 0) or 0)
         if errors > 0:
-            table.add_row("Monitor", f"[yellow]e={errors} ######## W[/yellow]")
+            table.add_row("Monitor", f"{errors:>6}  [yellow]######## W[/yellow]")
 
         return Panel(
             table,
