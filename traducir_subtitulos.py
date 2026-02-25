@@ -607,6 +607,10 @@ def subtitle_type_label_and_style(path: Path) -> Tuple[str, str]:
     return ext.lstrip(".").upper() or "FILE", "white"
 
 
+def file_has_es419_marker(path: Path) -> bool:
+    return "es-419" in path.name.lower()
+
+
 def show_app_header(console) -> None:
     title = "SubLLM Traductor de Subtitulos"
     subtitle = "ASS/SRT con Ollama local"
@@ -624,10 +628,16 @@ def show_app_header(console) -> None:
 
 def print_subtitle_option(console, idx: int, path: Path) -> None:
     label, style = subtitle_type_label_and_style(path)
+    file_style = style
+    suffix_hint = ""
+    if file_has_es419_marker(path):
+        file_style = "bold bright_green"
+        suffix_hint = " [bold bright_green][es-419][/bold bright_green]"
     if RICH_AVAILABLE:
-        console.print(f"  {idx}) [{style}]{path.name}[/{style}] [dim]({label})[/dim]")
+        console.print(f"  {idx}) [{file_style}]{path.name}[/{file_style}] [dim]({label})[/dim]{suffix_hint}")
     else:
-        console.print(f"  {idx}) {path.name} ({label})")
+        marker = " [es-419]" if file_has_es419_marker(path) else ""
+        console.print(f"  {idx}) {path.name} ({label}){marker}")
 
 
 def print_subtitle_options_table(console, files: List[Path]) -> None:
@@ -646,7 +656,10 @@ def print_subtitle_options_table(console, files: List[Path]) -> None:
     table.add_column("Archivo", overflow="fold")
     for i, f in enumerate(files, 1):
         label, style = subtitle_type_label_and_style(f)
-        table.add_row(str(i), f"[{style}]{label}[/{style}]", f.name)
+        file_text = f.name
+        if file_has_es419_marker(f):
+            file_text = f"[bold bright_green]{f.name}[/bold bright_green] [green][es-419][/green]"
+        table.add_row(str(i), f"[{style}]{label}[/{style}]", file_text)
     console.print(table)
 
 
@@ -4957,6 +4970,15 @@ def _parse_index_selection(raw: str, max_index: int) -> List[int]:
     return sorted(out)
 
 
+def _is_all_like_selection(raw: str, idxs: List[int], max_index: int) -> bool:
+    text = (raw or "").strip().lower()
+    if text in {"all", "*"}:
+        return True
+    if max_index > 0 and len(idxs) == max_index:
+        return True
+    return False
+
+
 def get_installed_models_list() -> List[str]:
     try:
         proc = subprocess.run(
@@ -5094,23 +5116,29 @@ def collect_batch_inputs(raw_input: str | None, target_lang: str) -> List[Path]:
 def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int | None, bool, str]:
     files = list_subtitle_files([".srt", ".ass"])
     in_paths: List[Path] = []
+    selected_all = False
     if files:
         print_subtitle_options_table(console, files)
         ass_count = sum(1 for p in files if p.suffix.lower() == ".ass")
         srt_count = sum(1 for p in files if p.suffix.lower() == ".srt")
+        es419_count = sum(1 for p in files if file_has_es419_marker(p))
         show_metrics_cards(
             console,
             [
                 ("Archivos", str(len(files)), None),
                 ("ASS", str(ass_count), None),
                 ("SRT", str(srt_count), None),
+                ("Con es-419", str(es419_count), "resaltados en verde"),
             ],
             title="Vista rapida",
-            columns=3,
+            columns=4,
         )
-        raw = input("Selecciona numero(s) de archivo (ej. 1 3 5, 1-4) o escribe una ruta (o 'all'): ").strip()
+        raw = input(
+            "Selecciona numero(s) de archivo (ej. 1 3 5, 1-4) o escribe una ruta (o 'all' para traducir todo y reescribir salidas): "
+        ).strip()
 
         idxs = _parse_index_selection(raw, len(files))
+        selected_all = _is_all_like_selection(raw, idxs, len(files))
         if idxs:
             in_paths = [files[i - 1] for i in idxs]
         elif raw:
@@ -5124,18 +5152,28 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
             if len(files) == 1:
                 in_paths = [files[0]]
     if not in_paths:
-        raw = input("Ingresa ruta de subtitulos (o 'all'): ").strip()
+        raw = input("Ingresa ruta de subtitulos (o 'all' para traducir todo y reescribir salidas): ").strip()
         idxs = _parse_index_selection(raw, len(files))
+        selected_all = selected_all or _is_all_like_selection(raw, idxs, len(files))
         if idxs and files:
             in_paths = [files[i - 1] for i in idxs]
         elif raw and raw.strip().lower() in {"all", "*"} and files:
             in_paths = files[:]
+            selected_all = True
         else:
             in_paths = [resolve_input_path(raw)]
 
     missing = [p for p in in_paths if not p.exists()]
     if missing:
         raise RuntimeError(f"Entrada no encontrada: {missing[0]}")
+
+    if selected_all and len(in_paths) > 1:
+        args.overwrite = True
+        cprint(
+            console,
+            "Seleccion total detectada: se reescribiran archivos de salida existentes para todos los subtitulos seleccionados.",
+            "bold yellow",
+        )
 
     sample_path = in_paths[0]
     text, _, _, _ = read_text(sample_path)

@@ -60,6 +60,8 @@ Opciones utiles:
 - `--parallel-files N`: cantidad de archivos en paralelo en `--batch` o multi-seleccion (usa subprocesos).
 - `--num-threads N`: hilos para Ollama (`6` por defecto).
 - `--overwrite`: con `--batch`, sobrescribe salidas existentes.
+- En modo interactivo, si eliges `all`, se activa reescritura de salidas existentes para toda la seleccion.
+- Los archivos que ya contienen `es-419` se muestran resaltados en verde en la lista interactiva.
 - En ejecuciones multiarchivo se muestra un panel dinamico persistente con:
   - progreso global/archivo/etapa,
   - actividad reciente,
