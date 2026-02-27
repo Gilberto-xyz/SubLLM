@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Tuple, TypeVar
 from urllib import request, error
+from urllib.parse import urlparse
 
 try:
     from rich.console import Console
@@ -1532,6 +1533,83 @@ def write_text(path: Path, lines: List[str], line_ending: str, final_newline: bo
     if bom:
         data = b"\xef\xbb\xbf" + data
     path.write_bytes(data)
+
+
+def is_local_ollama_host(host: str) -> bool:
+    raw = (host or "").strip()
+    if not raw:
+        return True
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    hostname = (parsed.hostname or "").strip().lower()
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def ollama_server_reachable(host: str, timeout: float = 1.0) -> bool:
+    base = (host or "http://localhost:11434").rstrip("/")
+    url = f"{base}/api/tags"
+    req = request.Request(url, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            return 200 <= status < 300
+    except Exception:
+        return False
+
+
+def start_ollama_serve_silent(host: str) -> subprocess.Popen | None:
+    env = os.environ.copy()
+    parsed = urlparse(host if "://" in host else f"http://{host}")
+    if parsed.netloc:
+        env.setdefault("OLLAMA_HOST", parsed.netloc)
+    creationflags = 0
+    startupinfo = None
+    if os.name == "nt":
+        creationflags = (
+            int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            | int(getattr(subprocess, "DETACHED_PROCESS", 0))
+        )
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0))
+        startupinfo.wShowWindow = 0
+    return subprocess.Popen(
+        ["ollama", "serve"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        creationflags=creationflags,
+        startupinfo=startupinfo,
+    )
+
+
+def ensure_local_ollama_server(console, host: str, wait_seconds: float = 20.0) -> bool:
+    if not is_local_ollama_host(host):
+        return True
+    if ollama_server_reachable(host, timeout=1.2):
+        return True
+    cprint(console, "Ollama no responde. Intentando iniciarlo en segundo plano...", "yellow")
+    proc = None
+    try:
+        proc = start_ollama_serve_silent(host)
+    except FileNotFoundError:
+        cprint(console, "No se encontro `ollama` en PATH. Instala Ollama o inicia el servicio manualmente.", "bold red")
+        return False
+    except Exception as exc:
+        cprint(console, f"No se pudo iniciar Ollama automaticamente: {exc}", "bold red")
+        return False
+
+    deadline = time.time() + max(1.0, float(wait_seconds))
+    while time.time() < deadline:
+        if ollama_server_reachable(host, timeout=1.0):
+            cprint(console, "Ollama iniciado automaticamente en segundo plano.", "bold green")
+            return True
+        if proc is not None and proc.poll() not in (None, 0):
+            break
+        time.sleep(0.4)
+
+    cprint(console, "No se pudo levantar Ollama automaticamente. Ejecuta `ollama serve` y reintenta.", "bold red")
+    return False
+
 
 class OllamaClient:
     def __init__(self, host: str, model: str, timeout: int, keep_alive: str | None = "10m") -> None:
@@ -5955,6 +6033,9 @@ def main() -> int:
             ),
             "bold cyan",
         )
+
+    if not ensure_local_ollama_server(console, args.host):
+        return 2
 
     client = OllamaClient(args.host, args.model, args.timeout, args.keep_alive)
     if args.num_ctx is not None:
