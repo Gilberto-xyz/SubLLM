@@ -6135,4 +6135,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        console = get_console()
+        cprint(console, "\nAdvertencia: el usuario cancelo la ejecucion del script.", "bold yellow")
+        raise SystemExit(130)
