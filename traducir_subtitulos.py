@@ -5244,19 +5244,18 @@ def interactive_flow(args, console) -> Tuple[List[Path], Path | None, str, int |
     out_choice = prompt_choice(console, "Idioma de salida", 2, default_out)
     target_lang = "Spanish" if out_choice == 1 else "English"
 
-    cprint(console, "Traducir muestra o completo?", "bold cyan")
-    console.print("  1) Muestra (10 lineas)")
-    console.print("  2) Completo")
-    scope_choice = prompt_choice(console, "Alcance", 2, 2)
-    limit = 10 if scope_choice == 1 else None
-    skip_summary = scope_choice == 1 or bool(args.skip_summary)
+    scope_choice = 2
+    limit = None
+    skip_summary = bool(args.skip_summary)
     show_execution_roadmap(
         console,
         include_summary=(not skip_summary),
         multi_file=(len(in_paths) > 1),
     )
 
-    model = choose_model(console, args.model)
+    model = "gemma3:4b"
+    cprint(console, "Alcance fijado automaticamente: Completo.", "yellow")
+    cprint(console, "Modelo fijado automaticamente: gemma3:4b.", "yellow")
 
     out_path = None
     if len(in_paths) == 1:
